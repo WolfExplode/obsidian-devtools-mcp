@@ -89,13 +89,29 @@ const tools = [
   {
     name: 'obsidian_execute_js',
     description:
-      'Execute arbitrary JavaScript in Obsidian\'s renderer context. Has access to `app`, `window`, etc.',
+      'Execute arbitrary JavaScript in Obsidian\'s RENDERER context. Has access to `app`, `window`, etc. Note: reaching MAIN-process state from here goes through `@electron/remote`, whose proxy forwards function calls but NOT property writes/deletes — so mutating main-process objects (e.g. `delete require.cache[...]`) silently no-ops. Use obsidian_execute_js_main for that.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         code: {
           type: 'string',
           description: 'JavaScript code to execute',
+        },
+      },
+      required: ['code'],
+    },
+  },
+  {
+    name: 'obsidian_execute_js_main',
+    description:
+      "Execute JavaScript in Electron's MAIN process (via @electron/remote's vm.runInThisContext) and return its JSON-serialized result. Use this when you must MUTATE main-process state — deleting a require.cache entry, tweaking a BrowserWindow, inspecting main-only globals — which obsidian_execute_js cannot do (the remote proxy drops property writes/deletes). `code` is an expression (wrap statements in an IIFE); a main-bound `require` is in scope. Synchronous: a returned Promise is NOT awaited.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        code: {
+          type: 'string',
+          description:
+            'JavaScript expression to evaluate in the main process (e.g. `(() => { delete require.cache[require.resolve(p)]; return Object.keys(require.cache).length; })()`)',
         },
       },
       required: ['code'],
@@ -123,6 +139,25 @@ const tools = [
         filter: {
           type: 'string',
           description: 'Filter commands by name (case-insensitive substring match)',
+        },
+      },
+    },
+  },
+  {
+    name: 'obsidian_list_leaves',
+    description:
+      'List every open workspace leaf (view) across all windows, including popout windows. ' +
+      'For each: viewType, file path, which window it lives in (main vs popout#N — the key ' +
+      'signal when debugging popouts, which are separate JS realms), whether it is the active ' +
+      'leaf, and hasExcalidrawApi (whether the Excalidraw imperative API has mounted). ' +
+      'Saves hand-writing an iterateAllLeaves snippet in obsidian_execute_js.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        viewType: {
+          type: 'string',
+          description:
+            'Optional case-insensitive substring filter on viewType (e.g. "excalidraw", "markdown").',
         },
       },
     },
@@ -373,6 +408,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case 'obsidian_execute_js_main': {
+        const code = args?.code as string;
+        if (!code) {
+          throw new Error('code is required');
+        }
+
+        const result = await obsidian.evaluateMain(code);
+        return {
+          content: [
+            {
+              type: 'text',
+              text:
+                typeof result === 'string'
+                  ? result
+                  : JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
       case 'obsidian_get_plugin_info': {
         const pluginId = args?.pluginId as string | undefined;
 
@@ -424,6 +479,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 name: cmd.name
               }))
               .sort((a, b) => a.name.localeCompare(b.name));
+          })()
+        `);
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case 'obsidian_list_leaves': {
+        const viewType = args?.viewType as string | undefined;
+
+        const result = await obsidian.evaluate(`
+          (function() {
+            const mainDoc = document;
+            const popoutDocs = [];
+            const filter = ${viewType ? JSON.stringify(viewType.toLowerCase()) : 'null'};
+            const rows = [];
+            app.workspace.iterateAllLeaves(leaf => {
+              const view = leaf.view || {};
+              const type = view.getViewType ? view.getViewType() : null;
+              // Map each leaf's owning document to a window label. Popout windows
+              // are separate documents (and separate JS realms) from the main one.
+              const doc = view.containerEl ? view.containerEl.ownerDocument : null;
+              let windowLabel = 'main';
+              if (doc && doc !== mainDoc) {
+                let idx = popoutDocs.indexOf(doc);
+                if (idx === -1) { idx = popoutDocs.length; popoutDocs.push(doc); }
+                windowLabel = 'popout' + (idx + 1);
+              }
+              rows.push({
+                viewType: type,
+                file: view.file ? view.file.path : null,
+                window: windowLabel,
+                active: app.workspace.activeLeaf === leaf,
+                hasExcalidrawApi: !!view.excalidrawAPI,
+              });
+            });
+            return rows.filter(r => !filter || (r.viewType || '').toLowerCase().includes(filter));
           })()
         `);
 

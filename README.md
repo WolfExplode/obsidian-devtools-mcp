@@ -6,7 +6,7 @@ MCP (Model Context Protocol) server for Obsidian that enables AI-assisted plugin
 
 - **Hot reload plugins** - Reload plugins without manual toggling
 - **Console log capture** - Read console logs/errors/warnings
-- **Execute JavaScript** - Run arbitrary JS in Obsidian's context
+- **Execute JavaScript** - Run arbitrary JS in Obsidian's renderer, or in the Electron main process (`obsidian_execute_js_main`)
 - **Plugin inspection** - Query plugin state, settings, and manifests
 - **Command execution** - Trigger Obsidian commands programmatically
 - **Svelte store access** - Read reactive store values from plugins
@@ -63,7 +63,8 @@ Reload the "doc-doctor" plugin and show any console errors.
 | `obsidian_reload_plugin` | Reload a plugin by ID |
 | `obsidian_get_console_logs` | Get buffered console output |
 | `obsidian_clear_console_logs` | Clear the log buffer |
-| `obsidian_execute_js` | Run arbitrary JavaScript |
+| `obsidian_execute_js` | Run arbitrary JavaScript in the **renderer** |
+| `obsidian_execute_js_main` | Run JavaScript in the Electron **main process** (mutate `require.cache`, BrowserWindows, main-only globals) |
 | `obsidian_get_plugin_info` | Query plugin info and manifests |
 | `obsidian_list_commands` | List available commands |
 | `obsidian_trigger_command` | Execute a command by ID |
@@ -102,6 +103,24 @@ Example workflow:
 Connect to Obsidian.
 Reload the "my-plugin" plugin and show me any errors.
 Execute: console.log(app.plugins.plugins['my-plugin'].settings)
+```
+
+## Renderer vs. main process (important)
+
+`obsidian_execute_js` evaluates in Obsidian's **renderer** (the CDP target is the page). `app`, `window`, and the DOM live there. To touch the Electron **main process** from the renderer you go through `@electron/remote` — and its proxy has a sharp edge:
+
+> **`@electron/remote` forwards function _calls_ to main, but NOT property _writes_ or _deletes_.**
+
+So `delete remote.require('module')._cache[key]` (or any assignment to a main-process object) is a **silent no-op** — it mutates the local proxy, never the real object in main. Reads through the proxy can also return stale/snapshotted views, so verifying a mutation by reading it back through `remote` gives false results. Verify **functionally** instead (change a value, reload, read it back).
+
+When you need to actually mutate main-process state — bust a `require.cache` entry so a main-process module (e.g. a plugin's `.cjs` helper loaded via `remote.require`) hot-reloads, tweak a `BrowserWindow`, read a main-only global — use **`obsidian_execute_js_main`**. It compiles your code and runs it *in* the main process via `remote.require('vm').runInThisContext`, where deletes and assignments take effect. It returns a JSON-serialized value; a main-bound `require` is in scope; execution is synchronous (a returned Promise is not awaited).
+
+```javascript
+// No-op via the proxy from the renderer:
+obsidian_execute_js({ code: `(() => { delete require('@electron/remote').require('module')._cache['X']; })()` })
+
+// Actually clears it, in main:
+obsidian_execute_js_main({ code: `(() => { delete require.cache['X']; return !require.cache['X']; })()` })
 ```
 
 ## Plugin MCP Bridge

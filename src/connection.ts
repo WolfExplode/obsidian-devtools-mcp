@@ -143,6 +143,67 @@ export class ObsidianConnection {
     return result.result.value as T;
   }
 
+  /**
+   * Execute code in Electron's MAIN process and return its (JSON-serialized)
+   * result. The CDP target is the renderer, so we hop into main via
+   * `@electron/remote`'s `vm.runInThisContext` — the code string is compiled and
+   * run in the main process's global context. This is the ONLY reliable way from
+   * here to *mutate* main-process state (e.g. `delete require.cache[...]`,
+   * BrowserWindow tweaks): reaching those objects through the remote proxy and
+   * assigning/deleting is a silent no-op, because the proxy forwards function
+   * calls but not property writes/deletes.
+   *
+   * `code` is evaluated as an expression (wrap statements in an IIFE, like
+   * obsidian_execute_js). A `require` bound to the main module is in scope.
+   * Execution is synchronous — a returned Promise is not awaited. Non-serializable
+   * results (functions, etc.) come back stringified rather than throwing.
+   */
+  async evaluateMain<T>(code: string): Promise<T> {
+    if (!this.client) {
+      throw new Error('Not connected to Obsidian. Use obsidian_connect first.');
+    }
+    // Runs in MAIN. process.mainModule.require gives main's require (with .cache).
+    const mainWrapper = `
+      (function () {
+        // In the main process's vm context there is no free \`require\`. Build a
+        // full one (with .cache === Module._cache and .resolve) from the main
+        // module, so user code can bust the cache, resolve paths, etc. Note that
+        // process.mainModule.require is Module.prototype.require and lacks .cache
+        // — createRequire is what yields the real thing.
+        var require;
+        try {
+          var Module = process.mainModule.constructor;
+          require = Module.createRequire(process.mainModule.filename);
+        } catch (e) {
+          require = (process.mainModule && process.mainModule.require) ||
+            (typeof global !== 'undefined' && global.require);
+        }
+        var __v;
+        try { __v = (${code}); }
+        catch (e) { return JSON.stringify({ __error: String((e && e.stack) || e) }); }
+        if (typeof __v === 'function') __v = String(__v);
+        try { return JSON.stringify(__v === undefined ? null : __v); }
+        catch (e) { return JSON.stringify(String(__v)); }
+      })()
+    `;
+    // Runs in the RENDERER: bridge into main and hand it the wrapper string.
+    const expression = `
+      (function () {
+        var req = (typeof require === 'function') ? require : window.require;
+        if (!req) throw new Error('nodeIntegration require unavailable in renderer');
+        var remote = req('@electron/remote');
+        if (!remote || !remote.require) throw new Error('@electron/remote unavailable');
+        return remote.require('vm').runInThisContext(${JSON.stringify(mainWrapper)});
+      })()
+    `;
+    const json = await this.evaluate<string>(expression);
+    const parsed = json == null ? null : JSON.parse(json);
+    if (parsed && typeof parsed === 'object' && '__error' in parsed) {
+      throw new Error('Main-process error: ' + (parsed as { __error: string }).__error);
+    }
+    return parsed as T;
+  }
+
   getConsoleLogs(options?: {
     level?: 'log' | 'warn' | 'error' | 'info' | 'debug' | 'all';
     limit?: number;
