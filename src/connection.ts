@@ -25,8 +25,16 @@ export interface ObsidianInfo {
   vaultPath: string;
 }
 
+export interface ProbeEvent {
+  timestamp: number;
+  data: unknown;
+}
+
 export class ObsidianConnection {
   private client: CDP.Client | null = null;
+  private mainTargetId: string | null = null;
+  private connectedPort = 9222;
+  private targetClients = new Map<string, CDP.Client>();
   private consoleLogs: ConsoleEntry[] = [];
   private connected = false;
   private readonly MAX_LOG_ENTRIES = 1000;
@@ -60,6 +68,8 @@ export class ObsidianConnection {
     }
 
     this.client = await CDP({ port, target: mainTarget.id });
+    this.mainTargetId = mainTarget.id;
+    this.connectedPort = port;
 
     // Enable necessary domains
     await this.client.Runtime.enable();
@@ -116,8 +126,36 @@ export class ObsidianConnection {
 
   async disconnect(): Promise<void> {
     if (this.client) {
+      // Probes are runtime instrumentation, not durable application state.
+      // Dispose them when the MCP session ends so a later session cannot inherit
+      // stale listeners from an earlier investigation.
+      try {
+        await this.evaluate(`
+          (() => {
+            const root = window.__obsidianDevtoolsProbes;
+            if (!root) return 0;
+            let removed = 0;
+            for (const id of Object.keys(root)) {
+              try { root[id].dispose(); } catch (_) {}
+              delete root[id];
+              removed++;
+            }
+            return removed;
+          })()
+        `);
+      } catch (_) {
+        // The renderer may already be gone; closing the CDP connection remains
+        // the important cleanup path.
+      }
+      for (const [id, target] of this.targetClients) {
+        if (target !== this.client) {
+          try { await target.close(); } catch (_) {}
+        }
+        this.targetClients.delete(id);
+      }
       await this.client.close();
       this.client = null;
+      this.mainTargetId = null;
       this.connected = false;
     }
   }
@@ -141,6 +179,104 @@ export class ObsidianConnection {
     }
 
     return result.result.value as T;
+  }
+
+  async listTargets(port = 9222): Promise<unknown[]> {
+    return (await CDP.List({ port })).map((target) => ({
+      id: target.id,
+      type: target.type,
+      title: target.title,
+      url: target.url,
+      attached: target.id === this.mainTargetId || this.targetClients.has(target.id),
+      isMain: target.id === this.mainTargetId,
+    }));
+  }
+
+  private async getClient(targetId?: string): Promise<CDP.Client> {
+    if (!targetId) {
+      if (!this.client) throw new Error('Not connected to Obsidian. Use obsidian_connect first.');
+      return this.client;
+    }
+    if (targetId === this.mainTargetId && this.client) return this.client;
+    let target = this.targetClients.get(targetId);
+    if (!target) {
+      target = await CDP({ port: this.connectedPort, target: targetId });
+      await target.Runtime.enable();
+      await target.Page.enable();
+      this.targetClients.set(targetId, target);
+    }
+    return target;
+  }
+
+  async evaluateInTarget<T>(expression: string, targetId?: string): Promise<T> {
+    const client = await this.getClient(targetId);
+    const result = await client.Runtime.evaluate({ expression, returnByValue: true, awaitPromise: true });
+    if (result.exceptionDetails) {
+      const error = result.exceptionDetails;
+      throw new Error(error.exception?.description || error.text || 'Unknown evaluation error');
+    }
+    return result.result.value as T;
+  }
+
+  /**
+   * Execute code in Electron's MAIN process and return its (JSON-serialized)
+   * result. The CDP target is the renderer, so we hop into main via
+   * `@electron/remote`'s `vm.runInThisContext` — the code string is compiled and
+   * run in the main process's global context. This is the ONLY reliable way from
+   * here to *mutate* main-process state (e.g. `delete require.cache[...]`,
+   * BrowserWindow tweaks): reaching those objects through the remote proxy and
+   * assigning/deleting is a silent no-op, because the proxy forwards function
+   * calls but not property writes/deletes.
+   *
+   * `code` is evaluated as an expression (wrap statements in an IIFE, like
+   * obsidian_execute_js). A `require` bound to the main module is in scope.
+   * Execution is synchronous — a returned Promise is not awaited. Non-serializable
+   * results (functions, etc.) come back stringified rather than throwing.
+   */
+  async evaluateMain<T>(code: string): Promise<T> {
+    if (!this.client) {
+      throw new Error('Not connected to Obsidian. Use obsidian_connect first.');
+    }
+    // Runs in MAIN. process.mainModule.require gives main's require (with .cache).
+    const mainWrapper = `
+      (function () {
+        // In the main process's vm context there is no free \`require\`. Build a
+        // full one (with .cache === Module._cache and .resolve) from the main
+        // module, so user code can bust the cache, resolve paths, etc. Note that
+        // process.mainModule.require is Module.prototype.require and lacks .cache
+        // — createRequire is what yields the real thing.
+        var require;
+        try {
+          var Module = process.mainModule.constructor;
+          require = Module.createRequire(process.mainModule.filename);
+        } catch (e) {
+          require = (process.mainModule && process.mainModule.require) ||
+            (typeof global !== 'undefined' && global.require);
+        }
+        var __v;
+        try { __v = (${code}); }
+        catch (e) { return JSON.stringify({ __error: String((e && e.stack) || e) }); }
+        if (typeof __v === 'function') __v = String(__v);
+        try { return JSON.stringify(__v === undefined ? null : __v); }
+        catch (e) { return JSON.stringify(String(__v)); }
+      })()
+    `;
+    // Runs in the RENDERER: bridge into main and hand it the wrapper string.
+    const expression = `
+      (function () {
+        var req = (typeof require === 'function') ? require : window.require;
+        if (!req) throw new Error('nodeIntegration require unavailable in renderer');
+        var remote = req('@electron/remote');
+        if (!remote || !remote.require) throw new Error('@electron/remote unavailable');
+        return remote.require('vm').runInThisContext(${JSON.stringify(mainWrapper)});
+      })()
+    `;
+    const json = await this.evaluate<string>(expression);
+    const parsed = json == null ? null : JSON.parse(json);
+    if (parsed && typeof parsed === 'object' && '__error' in parsed) {
+      throw new Error('Main-process error: ' + (parsed as { __error: string }).__error);
+    }
+    return parsed as T;
   }
 
   getConsoleLogs(options?: {
@@ -178,14 +314,94 @@ export class ObsidianConnection {
     this.consoleLogs = [];
   }
 
+  /** Install a named, disposable event probe in the renderer realm. */
+  async installProbe(id: string, installer: string, maxEvents = 500, targetId?: string): Promise<unknown> {
+    if (!/^[A-Za-z0-9_.:-]+$/.test(id)) throw new Error('Probe id contains invalid characters');
+    if (!installer.trim()) throw new Error('installer is required');
+    const boundedMax = Number.isFinite(maxEvents)
+      ? Math.max(1, Math.min(10000, Math.floor(maxEvents)))
+      : 500;
+    return this.evaluateInTarget(`
+      (() => {
+        const id = ${JSON.stringify(id)};
+        const maxEvents = ${boundedMax};
+        const root = window.__obsidianDevtoolsProbes ||= Object.create(null);
+        if (root[id]) { try { root[id].dispose(); } catch (_) {} }
+        const events = [];
+        const safe = (value) => {
+          if (value === undefined) return null;
+          try { return JSON.parse(JSON.stringify(value)); }
+          catch (_) { return String(value); }
+        };
+        const emit = (data) => {
+          events.push({ timestamp: Date.now(), data: safe(data) });
+          if (events.length > maxEvents) events.splice(0, events.length - maxEvents);
+        };
+        const factory = (${installer});
+        if (typeof factory !== 'function') throw new Error('installer must evaluate to a function');
+        const disposer = factory(emit);
+        if (typeof disposer !== 'function') throw new Error('installer must return a disposer function');
+        root[id] = { createdAt: Date.now(), maxEvents, events, dispose: disposer };
+        return { id, installed: true, maxEvents };
+      })()
+    `, targetId);
+  }
+
+  async readProbe(id: string, options?: { since?: number; limit?: number; clear?: boolean }, targetId?: string): Promise<unknown> {
+    const limit = options?.limit == null ? null : Math.max(1, Math.min(10000, Math.floor(options.limit)));
+    return this.evaluateInTarget(`
+      (() => {
+        const probe = window.__obsidianDevtoolsProbes?.[${JSON.stringify(id)}];
+        if (!probe) return { id: ${JSON.stringify(id)}, installed: false, events: [] };
+        let events = probe.events.slice();
+        ${options?.since != null ? `events = events.filter(e => e.timestamp >= ${Math.floor(options.since)});` : ''}
+        ${limit != null ? `events = events.slice(-${limit});` : ''}
+        const result = { id: ${JSON.stringify(id)}, installed: true, createdAt: probe.createdAt, events };
+        ${options?.clear ? 'probe.events.length = 0;' : ''}
+        return result;
+      })()
+    `, targetId);
+  }
+
+  async removeProbe(id: string, targetId?: string): Promise<unknown> {
+    return this.evaluateInTarget(`
+      (() => {
+        const root = window.__obsidianDevtoolsProbes;
+        const probe = root?.[${JSON.stringify(id)}];
+        if (!probe) return { id: ${JSON.stringify(id)}, removed: false };
+        try { probe.dispose(); } finally { delete root[${JSON.stringify(id)}]; }
+        return { id: ${JSON.stringify(id)}, removed: true };
+      })()
+    `, targetId);
+  }
+
+  async listProbes(targetId?: string): Promise<unknown> {
+    return this.evaluateInTarget(`
+      (() => Object.entries(window.__obsidianDevtoolsProbes || {}).map(([id, probe]) => ({
+        id, createdAt: probe.createdAt, bufferedEvents: probe.events.length, maxEvents: probe.maxEvents
+      })))()
+    `, targetId);
+  }
+
+  async waitFor<T>(predicate: string, timeoutMs = 5000, intervalMs = 100, targetId?: string): Promise<T> {
+    const started = Date.now();
+    let last: unknown;
+    while (Date.now() - started < timeoutMs) {
+      last = await this.evaluateInTarget(`(${predicate})`, targetId);
+      if (last) return last as T;
+      await new Promise((resolve) => setTimeout(resolve, Math.max(10, intervalMs)));
+    }
+    throw new Error(`Timed out after ${timeoutMs}ms waiting for condition. Last result: ${JSON.stringify(last)}`);
+  }
+
   async captureScreenshot(options?: {
     selector?: string;
     format?: 'png' | 'jpeg' | 'webp';
     quality?: number;
+    targetId?: string;
   }): Promise<string> {
-    if (!this.client) {
-      throw new Error('Not connected to Obsidian');
-    }
+    const targetId = options?.targetId;
+    const client = await this.getClient(targetId);
 
     let clip:
       | { x: number; y: number; width: number; height: number; scale: number }
@@ -193,7 +409,7 @@ export class ObsidianConnection {
 
     // If selector provided, get element bounds
     if (options?.selector) {
-      const bounds = await this.evaluate<{
+      const bounds = await this.evaluateInTarget<{
         x: number;
         y: number;
         width: number;
@@ -205,14 +421,14 @@ export class ObsidianConnection {
           const rect = el.getBoundingClientRect();
           return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
         })()
-      `);
+      `, targetId);
       if (!bounds) {
         throw new Error('Element not found: ' + options.selector);
       }
       clip = { ...bounds, scale: 1 };
     }
 
-    const result = await this.client.Page.captureScreenshot({
+    const result = await client.Page.captureScreenshot({
       format: options?.format || 'png',
       quality: options?.quality,
       clip,

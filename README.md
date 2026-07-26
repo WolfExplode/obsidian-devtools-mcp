@@ -5,8 +5,13 @@ MCP (Model Context Protocol) server for Obsidian that enables AI-assisted plugin
 ## Features
 
 - **Hot reload plugins** - Reload plugins without manual toggling
+- **Multi-window inspection** - Inspect and evaluate Popout and transparent-window renderer targets
 - **Console log capture** - Read console logs/errors/warnings
-- **Execute JavaScript** - Run arbitrary JS in Obsidian's context
+- **Persistent runtime probes** - Install named, disposable listeners with bounded event buffers
+- **Condition waiting** - Wait for real renderer readiness predicates with timeout diagnostics
+- **Excalidraw diagnostics** - Compare live scene state with the persisted scene and embedded file map
+- **Electron window inspection** - Inspect native BrowserWindow bounds, focus, and always-on-top state
+- **Execute JavaScript** - Run arbitrary JS in Obsidian's renderer, or in the Electron main process (`obsidian_execute_js_main`)
 - **Plugin inspection** - Query plugin state, settings, and manifests
 - **Command execution** - Trigger Obsidian commands programmatically
 - **Svelte store access** - Read reactive store values from plugins
@@ -60,18 +65,28 @@ Reload the "doc-doctor" plugin and show any console errors.
 |------|-------------|
 | `obsidian_connect` | Connect to Obsidian on specified port (default 9222) |
 | `obsidian_disconnect` | Disconnect from Obsidian |
+| `obsidian_list_targets` | List CDP renderer targets, including Popouts |
 | `obsidian_reload_plugin` | Reload a plugin by ID |
 | `obsidian_get_console_logs` | Get buffered console output |
 | `obsidian_clear_console_logs` | Clear the log buffer |
-| `obsidian_execute_js` | Run arbitrary JavaScript |
+| `obsidian_install_probe` | Install a named disposable renderer listener/probe |
+| `obsidian_read_probe` | Read/filter/clear buffered probe events |
+| `obsidian_remove_probe` | Dispose and remove a probe |
+| `obsidian_list_probes` | List installed probes and buffer sizes |
+| `obsidian_execute_js` | Run arbitrary JavaScript in the **renderer** |
+| `obsidian_execute_js_main` | Run JavaScript in the Electron **main process** (mutate `require.cache`, BrowserWindows, main-only globals) |
+| `obsidian_wait_for_condition` | Wait for a renderer predicate to become true |
 | `obsidian_get_plugin_info` | Query plugin info and manifests |
 | `obsidian_list_commands` | List available commands |
 | `obsidian_trigger_command` | Execute a command by ID |
 | `obsidian_get_vault_info` | Get vault information |
 | `obsidian_get_plugin_settings` | Read plugin settings |
+| `obsidian_get_plugin_diagnostics` | Read structured plugin lifecycle diagnostics |
 | `obsidian_get_store_state` | Read Svelte store values from a plugin |
 | `obsidian_call_plugin_mcp` | Call MCP tools through a plugin's embedded MCP client |
 | `obsidian_capture_screenshot` | Capture screenshot of viewport or specific element |
+| `obsidian_get_native_windows` | Inspect native Electron windows |
+| `obsidian_get_excalidraw_state` | Compare live and persisted Excalidraw state |
 
 ## Architecture
 
@@ -102,6 +117,50 @@ Example workflow:
 Connect to Obsidian.
 Reload the "my-plugin" plugin and show me any errors.
 Execute: console.log(app.plugins.plugins['my-plugin'].settings)
+```
+
+### Runtime probes
+
+For timing-sensitive behavior, install a probe once, reproduce the behavior
+manually, then read and remove it. The installer is a JavaScript function that
+receives `emit(data)` and returns a disposer. Events are JSON-sanitized and kept
+in a bounded ring buffer, so the probe does not depend on console timing.
+
+```javascript
+obsidian_install_probe({
+  id: "vault-modifies",
+  installer: `(emit) => {
+    const ref = app.vault.on("modify", file => emit({ path: file.path }));
+    return () => app.vault.offref(ref);
+  }`,
+  maxEvents: 200
+})
+
+obsidian_read_probe({ id: "vault-modifies", clear: true })
+obsidian_remove_probe({ id: "vault-modifies" })
+```
+
+For a scene or method trace, the installer can wrap an object method and emit a
+stack or selected fields before calling the original method. Keep probes
+read-only when investigating live user workflows, and always remove them when
+the test is complete.
+
+## Renderer vs. main process (important)
+
+`obsidian_execute_js` evaluates in Obsidian's **renderer** (the CDP target is the page). `app`, `window`, and the DOM live there. To touch the Electron **main process** from the renderer you go through `@electron/remote` — and its proxy has a sharp edge:
+
+> **`@electron/remote` forwards function _calls_ to main, but NOT property _writes_ or _deletes_.**
+
+So `delete remote.require('module')._cache[key]` (or any assignment to a main-process object) is a **silent no-op** — it mutates the local proxy, never the real object in main. Reads through the proxy can also return stale/snapshotted views, so verifying a mutation by reading it back through `remote` gives false results. Verify **functionally** instead (change a value, reload, read it back).
+
+When you need to actually mutate main-process state — bust a `require.cache` entry so a main-process module (e.g. a plugin's `.cjs` helper loaded via `remote.require`) hot-reloads, tweak a `BrowserWindow`, read a main-only global — use **`obsidian_execute_js_main`**. It compiles your code and runs it *in* the main process via `remote.require('vm').runInThisContext`, where deletes and assignments take effect. It returns a JSON-serialized value; a main-bound `require` is in scope; execution is synchronous (a returned Promise is not awaited).
+
+```javascript
+// No-op via the proxy from the renderer:
+obsidian_execute_js({ code: `(() => { delete require('@electron/remote').require('module')._cache['X']; })()` })
+
+// Actually clears it, in main:
+obsidian_execute_js_main({ code: `(() => { delete require.cache['X']; return !require.cache['X']; })()` })
 ```
 
 ## Plugin MCP Bridge

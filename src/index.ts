@@ -39,6 +39,11 @@ const tools = [
     },
   },
   {
+    name: 'obsidian_list_targets',
+    description: 'List renderer targets visible through CDP, including Obsidian Popouts and transparent windows.',
+    inputSchema: { type: 'object' as const, properties: { port: { type: 'number', default: 9222 } } },
+  },
+  {
     name: 'obsidian_reload_plugin',
     description: 'Reload a plugin by disabling and re-enabling it.',
     inputSchema: {
@@ -87,9 +92,57 @@ const tools = [
     },
   },
   {
+    name: 'obsidian_install_probe',
+    description:
+      'Install a named disposable event probe in Obsidian. The installer must be a JavaScript function expression receiving emit(data), and must return a disposer function. Events are buffered in the renderer until read or removal.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        id: { type: 'string', description: 'Probe identifier (letters, numbers, _, ., :, -)' },
+        installer: {
+          type: 'string',
+          description:
+            'JavaScript function expression, e.g. (emit) => { const ref = app.vault.on("modify", f => emit({path:f.path})); return () => app.vault.offref(ref); }',
+        },
+        maxEvents: { type: 'number', description: 'Maximum buffered events (default 500, maximum 10000)' },
+        targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
+      },
+      required: ['id', 'installer'],
+    },
+  },
+  {
+    name: 'obsidian_read_probe',
+    description: 'Read buffered events from a named renderer probe, optionally filtering by timestamp and limiting or clearing the buffer.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        id: { type: 'string', description: 'Probe identifier' },
+        since: { type: 'number', description: 'Only events at or after this Unix timestamp in milliseconds' },
+        limit: { type: 'number', description: 'Return only the most recent N events' },
+        clear: { type: 'boolean', description: 'Clear the probe buffer after reading' },
+        targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'obsidian_remove_probe',
+    description: 'Dispose and remove a named renderer probe.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: { id: { type: 'string', description: 'Probe identifier' }, targetId: { type: 'string' } },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'obsidian_list_probes',
+    description: 'List installed renderer probes and their buffered event counts.',
+    inputSchema: { type: 'object' as const, properties: { targetId: { type: 'string' } } },
+  },
+  {
     name: 'obsidian_execute_js',
     description:
-      'Execute arbitrary JavaScript in Obsidian\'s renderer context. Has access to `app`, `window`, etc.',
+      'Execute arbitrary JavaScript in Obsidian\'s RENDERER context. Has access to `app`, `window`, etc. Note: reaching MAIN-process state from here goes through `@electron/remote`, whose proxy forwards function calls but NOT property writes/deletes — so mutating main-process objects (e.g. `delete require.cache[...]`) silently no-ops. Use obsidian_execute_js_main for that.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -97,9 +150,44 @@ const tools = [
           type: 'string',
           description: 'JavaScript code to execute',
         },
+        targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
       },
       required: ['code'],
     },
+  },
+  {
+    name: 'obsidian_execute_js_main',
+    description:
+      "Execute JavaScript in Electron's MAIN process (via @electron/remote's vm.runInThisContext) and return its JSON-serialized result. Use this when you must MUTATE main-process state — deleting a require.cache entry, tweaking a BrowserWindow, inspecting main-only globals — which obsidian_execute_js cannot do (the remote proxy drops property writes/deletes). `code` is an expression (wrap statements in an IIFE); a main-bound `require` is in scope. Synchronous: a returned Promise is NOT awaited.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        code: {
+          type: 'string',
+          description:
+            'JavaScript expression to evaluate in the main process (e.g. `(() => { delete require.cache[require.resolve(p)]; return Object.keys(require.cache).length; })()`)',
+        },
+      },
+      required: ['code'],
+    },
+  },
+  {
+    name: 'obsidian_wait_for_condition',
+    description: 'Poll a JavaScript predicate in a selected renderer until it returns a truthy value or times out.',
+    inputSchema: { type: 'object' as const, properties: {
+      predicate: { type: 'string', description: 'JavaScript function expression or expression, e.g. () => !!document.querySelector(".excalidraw")' },
+      timeoutMs: { type: 'number', default: 5000 }, intervalMs: { type: 'number', default: 100 }, targetId: { type: 'string' },
+    }, required: ['predicate'] },
+  },
+  {
+    name: 'obsidian_get_native_windows',
+    description: 'Inspect Electron BrowserWindow instances, bounds, focus, always-on-top state, and webContents metadata.',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'obsidian_get_excalidraw_state',
+    description: 'Inspect live Excalidraw scenes and compare them with the parsed persisted scene for each matching leaf.',
+    inputSchema: { type: 'object' as const, properties: { file: { type: 'string' }, targetId: { type: 'string' } } },
   },
   {
     name: 'obsidian_get_plugin_info',
@@ -123,6 +211,25 @@ const tools = [
         filter: {
           type: 'string',
           description: 'Filter commands by name (case-insensitive substring match)',
+        },
+      },
+    },
+  },
+  {
+    name: 'obsidian_list_leaves',
+    description:
+      'List every open workspace leaf (view) across all windows, including popout windows. ' +
+      'For each: viewType, file path, which window it lives in (main vs popout#N — the key ' +
+      'signal when debugging popouts, which are separate JS realms), whether it is the active ' +
+      'leaf, and hasExcalidrawApi (whether the Excalidraw imperative API has mounted). ' +
+      'Saves hand-writing an iterateAllLeaves snippet in obsidian_execute_js.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        viewType: {
+          type: 'string',
+          description:
+            'Optional case-insensitive substring filter on viewType (e.g. "excalidraw", "markdown").',
         },
       },
     },
@@ -162,6 +269,11 @@ const tools = [
       },
       required: ['pluginId'],
     },
+  },
+  {
+    name: 'obsidian_get_plugin_diagnostics',
+    description: 'Read a plugin-provided structured diagnostic snapshot, including lifecycle state and bounded event history when available.',
+    inputSchema: { type: 'object' as const, properties: { pluginId: { type: 'string', description: 'Plugin ID' }, since: { type: 'number', description: 'Only return events at or after this timestamp' } }, required: ['pluginId'] },
   },
   {
     name: 'obsidian_get_store_state',
@@ -230,6 +342,7 @@ const tools = [
           type: 'string',
           description: 'File path to save image (omit to return base64)',
         },
+        targetId: { type: 'string', description: 'CDP target ID; omit for the main renderer' },
       },
     },
   },
@@ -271,6 +384,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{ type: 'text', text: 'Disconnected from Obsidian' }],
         };
+      }
+
+      case 'obsidian_list_targets': {
+        const result = await obsidian.listTargets((args?.port as number) ?? 9222);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
       case 'obsidian_reload_plugin': {
@@ -353,13 +471,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case 'obsidian_install_probe': {
+        const id = args?.id as string;
+        const installer = args?.installer as string;
+        if (!id) throw new Error('id is required');
+        if (!installer) throw new Error('installer is required');
+        const result = await obsidian.installProbe(id, installer, args?.maxEvents as number | undefined, args?.targetId as string | undefined);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'obsidian_read_probe': {
+        const id = args?.id as string;
+        if (!id) throw new Error('id is required');
+        const result = await obsidian.readProbe(id, {
+          since: args?.since as number | undefined,
+          limit: args?.limit as number | undefined,
+          clear: args?.clear as boolean | undefined,
+        }, args?.targetId as string | undefined);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'obsidian_remove_probe': {
+        const id = args?.id as string;
+        if (!id) throw new Error('id is required');
+        const result = await obsidian.removeProbe(id, args?.targetId as string | undefined);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'obsidian_list_probes': {
+        const result = await obsidian.listProbes(args?.targetId as string | undefined);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
       case 'obsidian_execute_js': {
         const code = args?.code as string;
         if (!code) {
           throw new Error('code is required');
         }
 
-        const result = await obsidian.evaluate(code);
+        const result = await obsidian.evaluateInTarget(code, args?.targetId as string | undefined);
         return {
           content: [
             {
@@ -371,6 +521,90 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
+      }
+
+      case 'obsidian_execute_js_main': {
+        const code = args?.code as string;
+        if (!code) {
+          throw new Error('code is required');
+        }
+
+        const result = await obsidian.evaluateMain(code);
+        return {
+          content: [
+            {
+              type: 'text',
+              text:
+                typeof result === 'string'
+                  ? result
+                  : JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'obsidian_wait_for_condition': {
+        const predicate = args?.predicate as string;
+        if (!predicate) throw new Error('predicate is required');
+        const result = await obsidian.waitFor(
+          predicate,
+          (args?.timeoutMs as number) ?? 5000,
+          (args?.intervalMs as number) ?? 100,
+          args?.targetId as string | undefined,
+        );
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'obsidian_get_native_windows': {
+        const result = await obsidian.evaluateMain(`(() => {
+          const { BrowserWindow } = require('electron');
+          return BrowserWindow.getAllWindows().map((win) => ({
+            id: win.id,
+            title: win.getTitle(),
+            url: (() => { try { return win.webContents.getURL(); } catch (_) { return null; } })(),
+            focused: win.isFocused(),
+            destroyed: win.isDestroyed(),
+            bounds: win.getBounds(),
+            alwaysOnTop: win.isAlwaysOnTop(),
+            webContentsId: win.webContents?.id ?? null,
+            devToolsOpened: win.webContents?.isDevToolsOpened?.() ?? false,
+          }));
+        })()`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'obsidian_get_excalidraw_state': {
+        const file = args?.file as string | undefined;
+        const result = await obsidian.evaluateInTarget(`(() => {
+          const wanted = ${JSON.stringify(file ?? null)};
+          const safeElement = (el) => ({
+            id: el.id, type: el.type, x: el.x, y: el.y, width: el.width, height: el.height,
+            angle: el.angle, fileId: el.fileId ?? null, crop: el.crop ?? null,
+            scale: el.scale ?? null, customData: el.customData ?? null,
+            isDeleted: !!el.isDeleted,
+          });
+          const rows = [];
+          app.workspace.iterateAllLeaves((leaf) => {
+            const view = leaf.view;
+            if (!view?.excalidrawAPI) return;
+            const path = view.file?.path ?? null;
+            if (wanted && path !== wanted) return;
+            const live = view.excalidrawAPI.getSceneElements?.() ?? [];
+            const persisted = view.excalidrawData?.scene?.elements ?? [];
+            const liveFiles = view.excalidrawAPI.getFiles?.() ?? {};
+            const persistedFiles = view.excalidrawData?.files ?? {};
+            const liveById = Object.fromEntries(live.map(safeElement).map(e => [e.id, e]));
+            const persistedById = Object.fromEntries(persisted.map(safeElement).map(e => [e.id, e]));
+            const ids = [...new Set([...Object.keys(liveById), ...Object.keys(persistedById)])];
+            const differences = ids.filter(id => JSON.stringify(liveById[id] ?? null) !== JSON.stringify(persistedById[id] ?? null));
+            rows.push({ path, viewType: view.getViewType?.() ?? null, liveElementCount: live.length,
+              persistedElementCount: persisted.length, liveFileIds: Object.keys(liveFiles),
+              persistedFileIds: Object.keys(persistedFiles), differences,
+              elements: { live: live.map(safeElement), persisted: persisted.map(safeElement) } });
+          });
+          return rows;
+        })()`, args?.targetId as string | undefined);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
       case 'obsidian_get_plugin_info': {
@@ -424,6 +658,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 name: cmd.name
               }))
               .sort((a, b) => a.name.localeCompare(b.name));
+          })()
+        `);
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case 'obsidian_list_leaves': {
+        const viewType = args?.viewType as string | undefined;
+
+        const result = await obsidian.evaluate(`
+          (function() {
+            const mainDoc = document;
+            const popoutDocs = [];
+            const filter = ${viewType ? JSON.stringify(viewType.toLowerCase()) : 'null'};
+            const rows = [];
+            app.workspace.iterateAllLeaves(leaf => {
+              const view = leaf.view || {};
+              const type = view.getViewType ? view.getViewType() : null;
+              // Map each leaf's owning document to a window label. Popout windows
+              // are separate documents (and separate JS realms) from the main one.
+              const doc = view.containerEl ? view.containerEl.ownerDocument : null;
+              let windowLabel = 'main';
+              if (doc && doc !== mainDoc) {
+                let idx = popoutDocs.indexOf(doc);
+                if (idx === -1) { idx = popoutDocs.length; popoutDocs.push(doc); }
+                windowLabel = 'popout' + (idx + 1);
+              }
+              rows.push({
+                viewType: type,
+                file: view.file ? view.file.path : null,
+                window: windowLabel,
+                active: app.workspace.activeLeaf === leaf,
+                hasExcalidrawApi: !!view.excalidrawAPI,
+              });
+            });
+            return rows.filter(r => !filter || (r.viewType || '').toLowerCase().includes(filter));
           })()
         `);
 
@@ -495,6 +767,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
         };
+      }
+
+      case 'obsidian_get_plugin_diagnostics': {
+        const pluginId = args?.pluginId as string;
+        if (!pluginId) throw new Error('pluginId is required');
+        const since = args?.since as number | undefined;
+        const result = await obsidian.evaluate(`(() => {
+          const plugin = app.plugins.plugins[${JSON.stringify(pluginId)}];
+          if (!plugin) return { error: 'Plugin not loaded: ' + ${JSON.stringify(pluginId)} };
+          if (typeof plugin.getDiagnostics !== 'function') return {
+            supported: false,
+            availableKeys: Object.keys(plugin).filter(k => !k.startsWith('_')),
+          };
+          const value = plugin.getDiagnostics();
+          if (${since == null ? 'false' : 'true'} && Array.isArray(value?.events)) {
+            value.events = value.events.filter(e => e.timestamp >= ${Math.floor(since ?? 0)});
+          }
+          return { supported: true, value };
+        })()`);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
       case 'obsidian_get_store_state': {
@@ -619,7 +911,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           selector,
           format,
           quality,
-        });
+          targetId: args?.targetId as string | undefined,
+        } as any);
 
         if (outputPath) {
           const buffer = Buffer.from(base64Data, 'base64');
