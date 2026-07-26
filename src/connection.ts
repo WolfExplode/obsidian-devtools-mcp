@@ -25,6 +25,11 @@ export interface ObsidianInfo {
   vaultPath: string;
 }
 
+export interface ProbeEvent {
+  timestamp: number;
+  data: unknown;
+}
+
 export class ObsidianConnection {
   private client: CDP.Client | null = null;
   private consoleLogs: ConsoleEntry[] = [];
@@ -116,6 +121,27 @@ export class ObsidianConnection {
 
   async disconnect(): Promise<void> {
     if (this.client) {
+      // Probes are runtime instrumentation, not durable application state.
+      // Dispose them when the MCP session ends so a later session cannot inherit
+      // stale listeners from an earlier investigation.
+      try {
+        await this.evaluate(`
+          (() => {
+            const root = window.__obsidianDevtoolsProbes;
+            if (!root) return 0;
+            let removed = 0;
+            for (const id of Object.keys(root)) {
+              try { root[id].dispose(); } catch (_) {}
+              delete root[id];
+              removed++;
+            }
+            return removed;
+          })()
+        `);
+      } catch (_) {
+        // The renderer may already be gone; closing the CDP connection remains
+        // the important cleanup path.
+      }
       await this.client.close();
       this.client = null;
       this.connected = false;
@@ -237,6 +263,75 @@ export class ObsidianConnection {
 
   clearConsoleLogs(): void {
     this.consoleLogs = [];
+  }
+
+  /** Install a named, disposable event probe in the renderer realm. */
+  async installProbe(id: string, installer: string, maxEvents = 500): Promise<unknown> {
+    if (!/^[A-Za-z0-9_.:-]+$/.test(id)) throw new Error('Probe id contains invalid characters');
+    if (!installer.trim()) throw new Error('installer is required');
+    const boundedMax = Number.isFinite(maxEvents)
+      ? Math.max(1, Math.min(10000, Math.floor(maxEvents)))
+      : 500;
+    return this.evaluate(`
+      (() => {
+        const id = ${JSON.stringify(id)};
+        const maxEvents = ${boundedMax};
+        const root = window.__obsidianDevtoolsProbes ||= Object.create(null);
+        if (root[id]) { try { root[id].dispose(); } catch (_) {} }
+        const events = [];
+        const safe = (value) => {
+          if (value === undefined) return null;
+          try { return JSON.parse(JSON.stringify(value)); }
+          catch (_) { return String(value); }
+        };
+        const emit = (data) => {
+          events.push({ timestamp: Date.now(), data: safe(data) });
+          if (events.length > maxEvents) events.splice(0, events.length - maxEvents);
+        };
+        const factory = (${installer});
+        if (typeof factory !== 'function') throw new Error('installer must evaluate to a function');
+        const disposer = factory(emit);
+        if (typeof disposer !== 'function') throw new Error('installer must return a disposer function');
+        root[id] = { createdAt: Date.now(), maxEvents, events, dispose: disposer };
+        return { id, installed: true, maxEvents };
+      })()
+    `);
+  }
+
+  async readProbe(id: string, options?: { since?: number; limit?: number; clear?: boolean }): Promise<unknown> {
+    const limit = options?.limit == null ? null : Math.max(1, Math.min(10000, Math.floor(options.limit)));
+    return this.evaluate(`
+      (() => {
+        const probe = window.__obsidianDevtoolsProbes?.[${JSON.stringify(id)}];
+        if (!probe) return { id: ${JSON.stringify(id)}, installed: false, events: [] };
+        let events = probe.events.slice();
+        ${options?.since != null ? `events = events.filter(e => e.timestamp >= ${Math.floor(options.since)});` : ''}
+        ${limit != null ? `events = events.slice(-${limit});` : ''}
+        const result = { id: ${JSON.stringify(id)}, installed: true, createdAt: probe.createdAt, events };
+        ${options?.clear ? 'probe.events.length = 0;' : ''}
+        return result;
+      })()
+    `);
+  }
+
+  async removeProbe(id: string): Promise<unknown> {
+    return this.evaluate(`
+      (() => {
+        const root = window.__obsidianDevtoolsProbes;
+        const probe = root?.[${JSON.stringify(id)}];
+        if (!probe) return { id: ${JSON.stringify(id)}, removed: false };
+        try { probe.dispose(); } finally { delete root[${JSON.stringify(id)}]; }
+        return { id: ${JSON.stringify(id)}, removed: true };
+      })()
+    `);
+  }
+
+  async listProbes(): Promise<unknown> {
+    return this.evaluate(`
+      (() => Object.entries(window.__obsidianDevtoolsProbes || {}).map(([id, probe]) => ({
+        id, createdAt: probe.createdAt, bufferedEvents: probe.events.length, maxEvents: probe.maxEvents
+      })))()
+    `);
   }
 
   async captureScreenshot(options?: {

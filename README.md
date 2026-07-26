@@ -6,6 +6,7 @@ MCP (Model Context Protocol) server for Obsidian that enables AI-assisted plugin
 
 - **Hot reload plugins** - Reload plugins without manual toggling
 - **Console log capture** - Read console logs/errors/warnings
+- **Persistent runtime probes** - Install named, disposable listeners with bounded event buffers
 - **Execute JavaScript** - Run arbitrary JS in Obsidian's renderer, or in the Electron main process (`obsidian_execute_js_main`)
 - **Plugin inspection** - Query plugin state, settings, and manifests
 - **Command execution** - Trigger Obsidian commands programmatically
@@ -63,6 +64,10 @@ Reload the "doc-doctor" plugin and show any console errors.
 | `obsidian_reload_plugin` | Reload a plugin by ID |
 | `obsidian_get_console_logs` | Get buffered console output |
 | `obsidian_clear_console_logs` | Clear the log buffer |
+| `obsidian_install_probe` | Install a named disposable renderer listener/probe |
+| `obsidian_read_probe` | Read/filter/clear buffered probe events |
+| `obsidian_remove_probe` | Dispose and remove a probe |
+| `obsidian_list_probes` | List installed probes and buffer sizes |
 | `obsidian_execute_js` | Run arbitrary JavaScript in the **renderer** |
 | `obsidian_execute_js_main` | Run JavaScript in the Electron **main process** (mutate `require.cache`, BrowserWindows, main-only globals) |
 | `obsidian_get_plugin_info` | Query plugin info and manifests |
@@ -104,6 +109,32 @@ Connect to Obsidian.
 Reload the "my-plugin" plugin and show me any errors.
 Execute: console.log(app.plugins.plugins['my-plugin'].settings)
 ```
+
+### Runtime probes
+
+For timing-sensitive behavior, install a probe once, reproduce the behavior
+manually, then read and remove it. The installer is a JavaScript function that
+receives `emit(data)` and returns a disposer. Events are JSON-sanitized and kept
+in a bounded ring buffer, so the probe does not depend on console timing.
+
+```javascript
+obsidian_install_probe({
+  id: "vault-modifies",
+  installer: `(emit) => {
+    const ref = app.vault.on("modify", file => emit({ path: file.path }));
+    return () => app.vault.offref(ref);
+  }`,
+  maxEvents: 200
+})
+
+obsidian_read_probe({ id: "vault-modifies", clear: true })
+obsidian_remove_probe({ id: "vault-modifies" })
+```
+
+For a scene or method trace, the installer can wrap an object method and emit a
+stack or selected fields before calling the original method. Keep probes
+read-only when investigating live user workflows, and always remove them when
+the test is complete.
 
 ## Renderer vs. main process (important)
 

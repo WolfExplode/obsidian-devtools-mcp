@@ -87,6 +87,52 @@ const tools = [
     },
   },
   {
+    name: 'obsidian_install_probe',
+    description:
+      'Install a named disposable event probe in Obsidian. The installer must be a JavaScript function expression receiving emit(data), and must return a disposer function. Events are buffered in the renderer until read or removal.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        id: { type: 'string', description: 'Probe identifier (letters, numbers, _, ., :, -)' },
+        installer: {
+          type: 'string',
+          description:
+            'JavaScript function expression, e.g. (emit) => { const ref = app.vault.on("modify", f => emit({path:f.path})); return () => app.vault.offref(ref); }',
+        },
+        maxEvents: { type: 'number', description: 'Maximum buffered events (default 500, maximum 10000)' },
+      },
+      required: ['id', 'installer'],
+    },
+  },
+  {
+    name: 'obsidian_read_probe',
+    description: 'Read buffered events from a named renderer probe, optionally filtering by timestamp and limiting or clearing the buffer.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        id: { type: 'string', description: 'Probe identifier' },
+        since: { type: 'number', description: 'Only events at or after this Unix timestamp in milliseconds' },
+        limit: { type: 'number', description: 'Return only the most recent N events' },
+        clear: { type: 'boolean', description: 'Clear the probe buffer after reading' },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'obsidian_remove_probe',
+    description: 'Dispose and remove a named renderer probe.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: { id: { type: 'string', description: 'Probe identifier' } },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'obsidian_list_probes',
+    description: 'List installed renderer probes and their buffered event counts.',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
     name: 'obsidian_execute_js',
     description:
       'Execute arbitrary JavaScript in Obsidian\'s RENDERER context. Has access to `app`, `window`, etc. Note: reaching MAIN-process state from here goes through `@electron/remote`, whose proxy forwards function calls but NOT property writes/deletes — so mutating main-process objects (e.g. `delete require.cache[...]`) silently no-ops. Use obsidian_execute_js_main for that.',
@@ -386,6 +432,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{ type: 'text', text: 'Console logs cleared' }],
         };
+      }
+
+      case 'obsidian_install_probe': {
+        const id = args?.id as string;
+        const installer = args?.installer as string;
+        if (!id) throw new Error('id is required');
+        if (!installer) throw new Error('installer is required');
+        const result = await obsidian.installProbe(id, installer, args?.maxEvents as number | undefined);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'obsidian_read_probe': {
+        const id = args?.id as string;
+        if (!id) throw new Error('id is required');
+        const result = await obsidian.readProbe(id, {
+          since: args?.since as number | undefined,
+          limit: args?.limit as number | undefined,
+          clear: args?.clear as boolean | undefined,
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'obsidian_remove_probe': {
+        const id = args?.id as string;
+        if (!id) throw new Error('id is required');
+        const result = await obsidian.removeProbe(id);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case 'obsidian_list_probes': {
+        const result = await obsidian.listProbes();
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
       case 'obsidian_execute_js': {
