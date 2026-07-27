@@ -8,6 +8,45 @@ import {
 import { writeFile } from 'fs/promises';
 import { obsidian } from './connection.js';
 
+// MCP responses become model context. Keep ordinary diagnostic responses useful
+// but bounded; callers can still use execute_js to request a deliberately
+// narrower or paginated view of very large data.
+const MAX_TOOL_OUTPUT_CHARS = 48_000;
+function toolText(value: unknown): string {
+  let raw: string;
+  if (typeof value === 'string') {
+    raw = value;
+  } else {
+    try {
+      raw = JSON.stringify(value, null, 2) ?? 'null';
+    } catch (error) {
+      raw = JSON.stringify({
+        serializationError: error instanceof Error ? error.message : String(error),
+        value: String(value),
+      }, null, 2);
+    }
+  }
+  if (raw.length <= MAX_TOOL_OUTPUT_CHARS) return raw;
+
+  const renderTruncated = (preview: string) => JSON.stringify({
+    truncated: true,
+    originalChars: raw.length,
+    previewChars: preview.length,
+    hint: 'Use filters, since, limit, file, storeName, or execute_js to request a narrower result.',
+    preview,
+  }, null, 2);
+
+  // JSON escaping can make the envelope larger than the raw preview. Shrink
+  // until the complete MCP text payload, rather than just its data field, fits.
+  let previewLength = Math.min(raw.length, MAX_TOOL_OUTPUT_CHARS);
+  let text = renderTruncated(raw.slice(0, previewLength));
+  while (text.length > MAX_TOOL_OUTPUT_CHARS && previewLength > 0) {
+    previewLength = Math.max(0, previewLength - (text.length - MAX_TOOL_OUTPUT_CHARS));
+    text = renderTruncated(raw.slice(0, previewLength));
+  }
+  return text;
+}
+
 const server = new Server(
   { name: 'obsidian-devtools-mcp', version: '1.0.0' },
   { capabilities: { tools: {} } }
@@ -59,7 +98,7 @@ const tools = [
   },
   {
     name: 'obsidian_get_console_logs',
-    description: 'Retrieve recent console output from Obsidian.',
+    description: 'Retrieve recent console output from Obsidian, including bounded stack traces when the runtime provides them.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -70,7 +109,7 @@ const tools = [
         },
         limit: {
           type: 'number',
-          description: 'Maximum number of entries to return',
+          description: 'Maximum entries to return (default 200, maximum 300; use 0 for none)',
         },
         since: {
           type: 'number',
@@ -94,7 +133,7 @@ const tools = [
   {
     name: 'obsidian_install_probe',
     description:
-      'Install a named disposable event probe in Obsidian. The installer must be a JavaScript function expression receiving emit(data), and must return a disposer function. Events are buffered in the renderer until read or removal.',
+      'Install a named disposable event probe in Obsidian. The installer must be a JavaScript function expression receiving emit(data), and must return a disposer function. Events are buffered in the renderer until read or removal. Payloads are automatically summarized and capped to keep responses usable: long strings, arrays, deep objects, and oversized events receive truncation metadata plus counts/samples.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -273,7 +312,7 @@ const tools = [
   {
     name: 'obsidian_get_plugin_diagnostics',
     description: 'Read a plugin-provided structured diagnostic snapshot, including lifecycle state and bounded event history when available.',
-    inputSchema: { type: 'object' as const, properties: { pluginId: { type: 'string', description: 'Plugin ID' }, since: { type: 'number', description: 'Only return events at or after this timestamp' } }, required: ['pluginId'] },
+    inputSchema: { type: 'object' as const, properties: { pluginId: { type: 'string', description: 'Plugin ID' }, since: { type: 'number', description: 'Only return events at or after this timestamp' }, limit: { type: 'number', description: 'Maximum events to return (default and maximum: 200)' } }, required: ['pluginId'] },
   },
   {
     name: 'obsidian_get_store_state',
@@ -366,13 +405,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(
+              text: toolText(
                 {
                   status: 'connected',
                   obsidian: info,
-                },
-                null,
-                2
+                }
               ),
             },
           ],
@@ -388,7 +425,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'obsidian_list_targets': {
         const result = await obsidian.listTargets((args?.port as number) ?? 9222);
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: toolText(result) }] };
       }
 
       case 'obsidian_reload_plugin': {
@@ -424,14 +461,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(
+              text: toolText(
                 {
                   status: 'reloaded',
                   pluginId,
                   errors: reloadLogs.map((l) => l.message),
-                },
-                null,
-                2
+                }
               ),
             },
           ],
@@ -450,14 +485,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(
+              text: toolText(
                 logs.map((l) => ({
                   time: new Date(l.timestamp).toISOString(),
                   level: l.level,
                   message: l.message,
+                  stackTrace: l.stackTrace,
                 })),
-                null,
-                2
               ),
             },
           ],
@@ -477,7 +511,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!id) throw new Error('id is required');
         if (!installer) throw new Error('installer is required');
         const result = await obsidian.installProbe(id, installer, args?.maxEvents as number | undefined, args?.targetId as string | undefined);
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: toolText(result) }] };
       }
 
       case 'obsidian_read_probe': {
@@ -488,19 +522,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           limit: args?.limit as number | undefined,
           clear: args?.clear as boolean | undefined,
         }, args?.targetId as string | undefined);
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: toolText(result) }] };
       }
 
       case 'obsidian_remove_probe': {
         const id = args?.id as string;
         if (!id) throw new Error('id is required');
         const result = await obsidian.removeProbe(id, args?.targetId as string | undefined);
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: toolText(result) }] };
       }
 
       case 'obsidian_list_probes': {
         const result = await obsidian.listProbes(args?.targetId as string | undefined);
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: toolText(result) }] };
       }
 
       case 'obsidian_execute_js': {
@@ -515,9 +549,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: 'text',
               text:
-                typeof result === 'string'
-                  ? result
-                  : JSON.stringify(result, null, 2),
+                toolText(result),
             },
           ],
         };
@@ -535,9 +567,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: 'text',
               text:
-                typeof result === 'string'
-                  ? result
-                  : JSON.stringify(result, null, 2),
+                toolText(result),
             },
           ],
         };
@@ -552,7 +582,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           (args?.intervalMs as number) ?? 100,
           args?.targetId as string | undefined,
         );
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: toolText(result) }] };
       }
 
       case 'obsidian_get_native_windows': {
@@ -570,7 +600,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             devToolsOpened: win.webContents?.isDevToolsOpened?.() ?? false,
           }));
         })()`);
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: toolText(result) }] };
       }
 
       case 'obsidian_get_excalidraw_state': {
@@ -604,7 +634,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           });
           return rows;
         })()`, args?.targetId as string | undefined);
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: toolText(result) }] };
       }
 
       case 'obsidian_get_plugin_info': {
@@ -639,7 +669,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `);
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: toolText(result) }],
         };
       }
 
@@ -662,7 +692,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `);
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: toolText(result) }],
         };
       }
 
@@ -700,7 +730,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `);
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: toolText(result) }],
         };
       }
 
@@ -722,7 +752,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `);
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: toolText(result) }],
         };
       }
 
@@ -744,7 +774,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `);
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: toolText(result) }],
         };
       }
 
@@ -765,7 +795,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `);
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: toolText(result) }],
         };
       }
 
@@ -773,6 +803,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const pluginId = args?.pluginId as string;
         if (!pluginId) throw new Error('pluginId is required');
         const since = args?.since as number | undefined;
+        const requestedLimit = args?.limit as number | undefined;
+        const limit = requestedLimit == null || !Number.isFinite(requestedLimit)
+          ? 200
+          : Math.max(0, Math.min(200, Math.floor(requestedLimit)));
+        const eventSlice = limit === 0 ? 'events.slice(0, 0)' : `events.slice(-${limit})`;
         const result = await obsidian.evaluate(`(() => {
           const plugin = app.plugins.plugins[${JSON.stringify(pluginId)}];
           if (!plugin) return { error: 'Plugin not loaded: ' + ${JSON.stringify(pluginId)} };
@@ -781,12 +816,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             availableKeys: Object.keys(plugin).filter(k => !k.startsWith('_')),
           };
           const value = plugin.getDiagnostics();
-          if (${since == null ? 'false' : 'true'} && Array.isArray(value?.events)) {
-            value.events = value.events.filter(e => e.timestamp >= ${Math.floor(since ?? 0)});
+          if (Array.isArray(value?.events)) {
+            const events = ${since == null ? 'value.events' : `value.events.filter(e => e.timestamp >= ${Math.floor(since)})`};
+            return { supported: true, value: { ...value, events: ${eventSlice} } };
           }
           return { supported: true, value };
         })()`);
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: 'text', text: toolText(result) }] };
       }
 
       case 'obsidian_get_store_state': {
@@ -856,7 +892,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `);
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: toolText(result) }],
         };
       }
 
@@ -897,7 +933,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `);
 
         return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: toolText(result) }],
         };
       }
 
@@ -921,10 +957,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: [
               {
                 type: 'text',
-                text: JSON.stringify(
-                  { saved: outputPath, size: buffer.length, format },
-                  null,
-                  2
+                text: toolText(
+                  { saved: outputPath, size: buffer.length, format }
                 ),
               },
             ],
@@ -935,16 +969,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(
+              text: toolText(
                 {
                   format,
                   dataLength: base64Data.length,
                   data:
                     base64Data.substring(0, 100) +
                     '... (truncated, use outputPath to save full image)',
-                },
-                null,
-                2
+                }
               ),
             },
           ],
@@ -957,7 +989,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
-      content: [{ type: 'text', text: `Error: ${message}` }],
+      content: [{ type: 'text', text: toolText(`Error: ${message}`) }],
       isError: true,
     };
   }

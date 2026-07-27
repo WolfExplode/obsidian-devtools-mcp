@@ -37,7 +37,12 @@ export class ObsidianConnection {
   private targetClients = new Map<string, CDP.Client>();
   private consoleLogs: ConsoleEntry[] = [];
   private connected = false;
-  private readonly MAX_LOG_ENTRIES = 1000;
+  // Console output is diagnostic context, not an archival log. Keeping this
+  // small prevents a noisy vault from silently inflating every later request.
+  private readonly MAX_LOG_ENTRIES = 300;
+  private readonly MAX_LOG_MESSAGE_CHARS = 4000;
+  private readonly MAX_STACK_FRAMES = 8;
+  private readonly MAX_STACK_FRAME_TEXT_CHARS = 1024;
 
   isConnected(): boolean {
     return this.connected && this.client !== null;
@@ -88,12 +93,30 @@ export class ObsidianConnection {
         return arg.description || `[${arg.type}]`;
       });
 
+      const message = args.join(' ');
+      const stackTrace = params.stackTrace
+        ? {
+            callFrames: params.stackTrace.callFrames
+              .slice(0, this.MAX_STACK_FRAMES)
+              .map((frame) => ({
+                functionName: frame.functionName.slice(0, this.MAX_STACK_FRAME_TEXT_CHARS),
+                scriptId: frame.scriptId,
+                url: frame.url.slice(0, this.MAX_STACK_FRAME_TEXT_CHARS),
+                lineNumber: frame.lineNumber,
+                columnNumber: frame.columnNumber,
+              })),
+          }
+        : undefined;
       this.consoleLogs.push({
         timestamp: Date.now(),
         level: params.type,
-        message: args.join(' '),
-        args: params.args,
-        stackTrace: params.stackTrace,
+        message: message.length > this.MAX_LOG_MESSAGE_CHARS
+          ? message.slice(0, this.MAX_LOG_MESSAGE_CHARS) + '…'
+          : message,
+        // Do not retain the full CDP RemoteObject graph. The rendered message
+        // plus a compact stack trace preserves useful diagnostic context.
+        args: [],
+        stackTrace,
       });
 
       // Keep buffer bounded
@@ -298,8 +321,14 @@ export class ObsidianConnection {
     }
 
     // Limit results
-    if (options?.limit) {
-      logs = logs.slice(-options.limit);
+    const requestedLimit = options?.limit;
+    const limit = requestedLimit == null || !Number.isFinite(requestedLimit)
+      ? 200
+      : Math.max(0, Math.min(this.MAX_LOG_ENTRIES, Math.floor(requestedLimit)));
+    if (limit === 0) {
+      logs = [];
+    } else {
+      logs = logs.slice(-limit);
     }
 
     // Clear logs if requested
@@ -328,10 +357,62 @@ export class ObsidianConnection {
         const root = window.__obsidianDevtoolsProbes ||= Object.create(null);
         if (root[id]) { try { root[id].dispose(); } catch (_) {} }
         const events = [];
+        // Probes are commonly attached to high-volume UI callbacks. Normalize their
+        // payloads before buffering so one large selection, scene, or error cannot
+        // make the entire MCP response unreadable.
+        const MAX_EVENT_BYTES = 16 * 1024;
+        const MAX_DEPTH = 6;
+        const MAX_ARRAY_ITEMS = 50;
+        const MAX_OBJECT_KEYS = 50;
+        const MAX_STRING_LENGTH = 2048;
+        const summarize = (value, depth = 0, seen = new WeakSet()) => {
+          if (value == null || typeof value === 'boolean' || typeof value === 'number') return value;
+          if (typeof value === 'string') {
+            return value.length <= MAX_STRING_LENGTH
+              ? value
+              : { truncated: true, originalLength: value.length, sample: value.slice(0, MAX_STRING_LENGTH) };
+          }
+          if (typeof value === 'bigint') return String(value) + 'n';
+          if (typeof value === 'undefined') return null;
+          if (typeof value === 'function' || typeof value === 'symbol') return String(value);
+          if (depth >= MAX_DEPTH) return { truncated: true, reason: 'max-depth', type: Array.isArray(value) ? 'array' : typeof value };
+          if (typeof value !== 'object') return String(value);
+          if (seen.has(value)) return { truncated: true, reason: 'circular' };
+          seen.add(value);
+          if (Array.isArray(value)) {
+            const sample = value.slice(0, MAX_ARRAY_ITEMS).map(item => summarize(item, depth + 1, seen));
+            const result = value.length > MAX_ARRAY_ITEMS
+              ? { count: value.length, sample, truncated: true }
+              : sample;
+            seen.delete(value);
+            return result;
+          }
+          const keys = Object.keys(value);
+          const output = {};
+          for (const key of keys.slice(0, MAX_OBJECT_KEYS)) output[key] = summarize(value[key], depth + 1, seen);
+          if (keys.length > MAX_OBJECT_KEYS) {
+            output._truncated = true;
+            output._omittedKeys = keys.length - MAX_OBJECT_KEYS;
+          }
+          seen.delete(value);
+          return output;
+        };
         const safe = (value) => {
-          if (value === undefined) return null;
-          try { return JSON.parse(JSON.stringify(value)); }
-          catch (_) { return String(value); }
+          let normalized;
+          try { normalized = summarize(value); }
+          catch (_) { normalized = { truncated: true, reason: 'normalization-failed', type: typeof value }; }
+          let serialized;
+          try { serialized = JSON.stringify(normalized); }
+          catch (_) { return { truncated: true, reason: 'serialization-failed', type: typeof value }; }
+          if (serialized.length <= MAX_EVENT_BYTES) return normalized;
+          return {
+            truncated: true,
+            reason: 'max-event-bytes',
+            originalBytes: serialized.length,
+            type: Array.isArray(value) ? 'array' : typeof value,
+            keys: value && typeof value === 'object' && !Array.isArray(value) ? Object.keys(value).slice(0, 20) : undefined,
+            count: Array.isArray(value) ? value.length : undefined,
+          };
         };
         const emit = (data) => {
           events.push({ timestamp: Date.now(), data: safe(data) });

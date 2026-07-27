@@ -67,7 +67,7 @@ Reload the "doc-doctor" plugin and show any console errors.
 | `obsidian_disconnect` | Disconnect from Obsidian |
 | `obsidian_list_targets` | List CDP renderer targets, including Popouts |
 | `obsidian_reload_plugin` | Reload a plugin by ID |
-| `obsidian_get_console_logs` | Get buffered console output |
+| `obsidian_get_console_logs` | Get buffered console output and compact stack traces when available |
 | `obsidian_clear_console_logs` | Clear the log buffer |
 | `obsidian_install_probe` | Install a named disposable renderer listener/probe |
 | `obsidian_read_probe` | Read/filter/clear buffered probe events |
