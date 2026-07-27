@@ -643,8 +643,21 @@ export class ObsidianConnection {
       const inject = (win) => {
         try {
           const wc = win.webContents;
-          const run = () => { if (matches(win)) wc.executeJavaScript(script).catch(() => {}); };
-          if (wc.isLoading()) wc.once('did-finish-load', run); else run();
+          let injected = false;
+          const run = () => {
+            if (injected) return;
+            if (matches(win)) { injected = true; wc.executeJavaScript(script).catch(() => {}); }
+          };
+          // Right when 'browser-window-created' fires -- before loadURL/loadFile
+          // has been called at all -- isLoading() is already false, because
+          // nothing has been asked of the page yet, not because navigation
+          // finished. Checking the URL at that instant sees the blank initial
+          // state and a real urlPattern never matches. Always wait for
+          // did-finish-load for the real navigation; also try immediately for
+          // the rare case of a window built from webContents that had already
+          // finished loading before this hook ran.
+          wc.on('did-finish-load', run);
+          if (!wc.isLoading() && wc.getURL()) run();
         } catch (e) {}
       };
 
