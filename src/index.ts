@@ -12,19 +12,21 @@ import { ToolRegistry, type Toolset } from './tool-registry.js';
 // MCP responses become model context. Keep ordinary diagnostic responses useful
 // but bounded; callers can still use execute_js to request a deliberately
 // narrower or paginated view of very large data.
-const MAX_TOOL_OUTPUT_CHARS = 48_000;
+// Tool results are injected into model context. This is a final safety net;
+// individual tools should still choose small, useful defaults.
+const MAX_TOOL_OUTPUT_CHARS = 12_000;
 function toolText(value: unknown): string {
   let raw: string;
   if (typeof value === 'string') {
     raw = value;
   } else {
     try {
-      raw = JSON.stringify(value, null, 2) ?? 'null';
+      raw = JSON.stringify(value) ?? 'null';
     } catch (error) {
       raw = JSON.stringify({
         serializationError: error instanceof Error ? error.message : String(error),
         value: String(value),
-      }, null, 2);
+      });
     }
   }
   if (raw.length <= MAX_TOOL_OUTPUT_CHARS) return raw;
@@ -35,7 +37,7 @@ function toolText(value: unknown): string {
     previewChars: preview.length,
     hint: 'Use filters, since, limit, file, storeName, or execute_js to request a narrower result.',
     preview,
-  }, null, 2);
+  });
 
   // JSON escaping can make the envelope larger than the raw preview. Shrink
   // until the complete MCP text payload, rather than just its data field, fits.
@@ -46,6 +48,35 @@ function toolText(value: unknown): string {
     text = renderTruncated(raw.slice(0, previewLength));
   }
   return text;
+}
+
+type Detail = 'summary' | 'full';
+
+function detailOf(args: Record<string, unknown> | undefined): Detail {
+  return args?.detail === 'full' ? 'full' : 'summary';
+}
+
+/** A bounded structural preview for opaque plugin and JavaScript values. */
+function summarizeValue(value: unknown, depth = 0): unknown {
+  if (value == null || typeof value === 'boolean' || typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    return value.length <= 500 ? value : { type: 'string', length: value.length, preview: value.slice(0, 500) };
+  }
+  if (typeof value !== 'object') return String(value);
+  if (depth >= 2) return Array.isArray(value)
+    ? { type: 'array', count: value.length }
+    : { type: 'object', keys: Object.keys(value as object).slice(0, 20) };
+  if (Array.isArray(value)) {
+    return { type: 'array', count: value.length, sample: value.slice(0, 10).map((item) => summarizeValue(item, depth + 1)) };
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  return {
+    type: 'object',
+    keyCount: keys.length,
+    value: Object.fromEntries(keys.slice(0, 20).map((key) => [key, summarizeValue(record[key], depth + 1)])),
+    ...(keys.length > 20 ? { omittedKeys: keys.length - 20 } : {}),
+  };
 }
 
 const server = new Server(
@@ -210,7 +241,7 @@ async function getExcalidrawSceneSummary(file: string, targetId?: string): Promi
 const allTools = [
   {
     name: 'obsidian_discover_tools',
-    description: 'Find the right Obsidian development capability, then enable its toolset if needed.',
+    description: 'Recommend a toolset for an Obsidian task.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -221,7 +252,7 @@ const allTools = [
   },
   {
     name: 'obsidian_set_toolset',
-    description: 'Switch visible tools: core for routine plugin work, diagnostics for probes and inspection, full for every tool.',
+    description: 'Set visible toolset: core, diagnostics, or full.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -233,8 +264,7 @@ const allTools = [
   },
   {
     name: 'obsidian_connect',
-    description:
-      'Connect to a running Obsidian instance with remote debugging enabled. Must be called before using other obsidian_* tools.',
+    description: 'Connect to Obsidian. Required before other tools.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -256,12 +286,12 @@ const allTools = [
   },
   {
     name: 'obsidian_list_targets',
-    description: 'List renderer targets visible through CDP, including Obsidian Popouts and transparent windows.',
+    description: 'List Obsidian renderer targets.',
     inputSchema: { type: 'object' as const, properties: { port: { type: 'number', default: 9222 } } },
   },
   {
     name: 'obsidian_reload_plugin',
-    description: 'Reload a plugin by disabling and re-enabling it.',
+    description: 'Reload a plugin.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -275,7 +305,7 @@ const allTools = [
   },
   {
     name: 'obsidian_get_console_logs',
-    description: 'Retrieve recent console output from Obsidian, including bounded stack traces when the runtime provides them.',
+    description: 'Read buffered console logs.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -296,6 +326,7 @@ const allTools = [
           type: 'boolean',
           description: 'Clear the log buffer after reading',
         },
+        detail: { type: 'string', enum: ['summary', 'full'], description: 'summary returns recent messages without stacks (default); full includes stack traces' },
       },
     },
   },
@@ -309,8 +340,7 @@ const allTools = [
   },
   {
     name: 'obsidian_install_probe',
-    description:
-      'Install a named disposable event probe in Obsidian. The installer must be a JavaScript function expression receiving emit(data), and must return a disposer function. Events are buffered in the renderer until read or removal. Payloads are automatically summarized and capped to keep responses usable: long strings, arrays, deep objects, and oversized events receive truncation metadata plus counts/samples.',
+    description: 'Install a disposable renderer event probe.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -331,13 +361,13 @@ const allTools = [
   },
   {
     name: 'obsidian_read_probe',
-    description: 'Read buffered events from a named renderer probe, optionally filtering by timestamp and limiting or clearing the buffer.',
+    description: 'Read buffered probe events.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         id: { type: 'string', description: 'Probe identifier' },
         since: { type: 'number', description: 'Only events at or after this Unix timestamp in milliseconds' },
-        limit: { type: 'number', description: 'Return only the most recent N events' },
+        limit: { type: 'number', description: 'Return only the most recent N events (default 50)' },
         clear: { type: 'boolean', description: 'Clear the probe buffer after reading' },
         includeRaw: { type: 'boolean', description: 'Include opt-in preserved raw payload JSON' },
         targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
@@ -347,7 +377,7 @@ const allTools = [
   },
   {
     name: 'obsidian_watch_excalidraw',
-    description: 'Install an Excalidraw scene watcher. Compact mode (default) collapses rapid edits into actions and condenses selection/zoom-only callbacks; all mode exposes every callback.',
+    description: 'Watch an Excalidraw scene; compact mode is default.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -363,7 +393,7 @@ const allTools = [
   },
   {
     name: 'obsidian_start_excalidraw_bug_window',
-    description: 'Begin a bounded Excalidraw debugging window. Reproduce the problem, then call obsidian_finish_excalidraw_bug_window to receive a correlated report of scene deltas, console output, and live-versus-persisted state.',
+    description: 'Start a bounded Excalidraw bug capture.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -377,13 +407,13 @@ const allTools = [
   },
   {
     name: 'obsidian_finish_excalidraw_bug_window',
-    description: 'Finish an Excalidraw bug window and return its correlated report. Default timeline detail includes each event once; source arrays are opt-in. The capture listener is removed by default.',
+    description: 'Finish an Excalidraw bug capture and return a report.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         id: { type: 'string', description: 'Capture identifier returned by obsidian_start_excalidraw_bug_window' },
         keepOpen: { type: 'boolean', description: 'Keep the listener installed for another reproduction (default false)' },
-        eventLimit: { type: 'number', description: 'Maximum scene events included in the report (default 200)' },
+        eventLimit: { type: 'number', description: 'Maximum scene events included in the report (default 50)' },
         detail: { type: 'string', enum: ['summary', 'timeline', 'sources'], description: 'Report evidence view: counts only, one merged timeline (default), or separate scene/console arrays' },
       },
       required: ['id'],
@@ -391,21 +421,21 @@ const allTools = [
   },
   {
     name: 'obsidian_get_diagnostic_timeline',
-    description: 'Merge buffered probe events, grouped console logs, and optional plugin diagnostic events into a timestamp-sorted timeline.',
+    description: 'Merge probe, console, and plugin events by time.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         probeId: { type: 'string', description: 'Optional probe whose events to include' },
         pluginId: { type: 'string', description: 'Optional plugin whose getDiagnostics().events to include' },
         since: { type: 'number', description: 'Only include entries at or after this Unix timestamp in milliseconds' },
-        limit: { type: 'number', description: 'Maximum timeline entries (default 200, maximum 1000)' },
+        limit: { type: 'number', description: 'Maximum timeline entries (default 50, maximum 1000)' },
         targetId: { type: 'string', description: 'CDP target ID for probe/plugin lookup' },
       },
     },
   },
   {
     name: 'obsidian_remove_probe',
-    description: 'Dispose and remove a named renderer probe.',
+    description: 'Remove a renderer probe.',
     inputSchema: {
       type: 'object' as const,
       properties: { id: { type: 'string', description: 'Probe identifier' }, targetId: { type: 'string' } },
@@ -414,13 +444,12 @@ const allTools = [
   },
   {
     name: 'obsidian_list_probes',
-    description: 'List installed renderer probes and their buffered event counts.',
+    description: 'List renderer probes.',
     inputSchema: { type: 'object' as const, properties: { targetId: { type: 'string' } } },
   },
   {
     name: 'obsidian_execute_js',
-    description:
-      'Execute arbitrary JavaScript in Obsidian\'s RENDERER context. Has access to `app`, `window`, etc. Note: reaching MAIN-process state from here goes through `@electron/remote`, whose proxy forwards function calls but NOT property writes/deletes — so mutating main-process objects (e.g. `delete require.cache[...]`) silently no-ops. Use obsidian_execute_js_main for that.',
+    description: 'Run JavaScript in the Obsidian renderer.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -435,8 +464,7 @@ const allTools = [
   },
   {
     name: 'obsidian_execute_js_main',
-    description:
-      "Execute JavaScript in Electron's MAIN process (via @electron/remote's vm.runInThisContext) and return its JSON-serialized result. Use this when you must MUTATE main-process state — deleting a require.cache entry, tweaking a BrowserWindow, inspecting main-only globals — which obsidian_execute_js cannot do (the remote proxy drops property writes/deletes). `code` is an expression (wrap statements in an IIFE); a main-bound `require` is in scope. Synchronous: a returned Promise is NOT awaited.",
+    description: 'Run a synchronous JavaScript expression in Electron main.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -451,7 +479,7 @@ const allTools = [
   },
   {
     name: 'obsidian_wait_for_condition',
-    description: 'Poll a JavaScript predicate in a selected renderer until it returns a truthy value or times out.',
+    description: 'Wait for a renderer predicate to be truthy.',
     inputSchema: { type: 'object' as const, properties: {
       predicate: { type: 'string', description: 'JavaScript function expression or expression, e.g. () => !!document.querySelector(".excalidraw")' },
       timeoutMs: { type: 'number', default: 5000 }, intervalMs: { type: 'number', default: 100 }, targetId: { type: 'string' },
@@ -459,17 +487,17 @@ const allTools = [
   },
   {
     name: 'obsidian_get_native_windows',
-    description: 'Inspect Electron BrowserWindow instances, bounds, focus, always-on-top state, and webContents metadata.',
+    description: 'Inspect Electron windows.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
   {
     name: 'obsidian_get_excalidraw_state',
-    description: 'Inspect live Excalidraw scenes and compare them with the parsed persisted scene for each matching leaf.',
-    inputSchema: { type: 'object' as const, properties: { file: { type: 'string' }, targetId: { type: 'string' } } },
+    description: 'Compare live and persisted Excalidraw state.',
+    inputSchema: { type: 'object' as const, properties: { file: { type: 'string' }, targetId: { type: 'string' }, detail: { type: 'string', enum: ['summary', 'full'], description: 'summary returns counts and difference IDs (default); full includes element records' } } },
   },
   {
     name: 'obsidian_get_plugin_info',
-    description: 'Get information about installed plugins.',
+    description: 'Inspect installed plugins.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -477,12 +505,13 @@ const allTools = [
           type: 'string',
           description: 'Specific plugin ID (omit for all plugins)',
         },
+        detail: { type: 'string', enum: ['summary', 'full'], description: 'summary omits the full manifest (default)' },
       },
     },
   },
   {
     name: 'obsidian_list_commands',
-    description: 'List available commands from Obsidian\'s command palette.',
+    description: 'List Obsidian commands.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -490,17 +519,13 @@ const allTools = [
           type: 'string',
           description: 'Filter commands by name (case-insensitive substring match)',
         },
+        limit: { type: 'number', description: 'Maximum commands to return (default 50, maximum 200)' },
       },
     },
   },
   {
     name: 'obsidian_list_leaves',
-    description:
-      'List every open workspace leaf (view) across all windows, including popout windows. ' +
-      'For each: viewType, file path, which window it lives in (main vs popout#N — the key ' +
-      'signal when debugging popouts, which are separate JS realms), whether it is the active ' +
-      'leaf, and hasExcalidrawApi (whether the Excalidraw imperative API has mounted). ' +
-      'Saves hand-writing an iterateAllLeaves snippet in obsidian_execute_js.',
+    description: 'List open workspace leaves and their windows.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -514,7 +539,7 @@ const allTools = [
   },
   {
     name: 'obsidian_trigger_command',
-    description: 'Execute an Obsidian command by ID.',
+    description: 'Run an Obsidian command.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -528,7 +553,7 @@ const allTools = [
   },
   {
     name: 'obsidian_get_vault_info',
-    description: 'Get current vault information.',
+    description: 'Get vault metadata.',
     inputSchema: {
       type: 'object' as const,
       properties: {},
@@ -536,7 +561,7 @@ const allTools = [
   },
   {
     name: 'obsidian_get_plugin_settings',
-    description: 'Read a plugin\'s saved settings.',
+    description: 'Read plugin settings.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -544,19 +569,19 @@ const allTools = [
           type: 'string',
           description: 'The plugin ID to get settings for',
         },
+        detail: { type: 'string', enum: ['summary', 'full'], description: 'summary returns setting keys and a preview (default)' },
       },
       required: ['pluginId'],
     },
   },
   {
     name: 'obsidian_get_plugin_diagnostics',
-    description: 'Read a plugin-provided structured diagnostic snapshot, including lifecycle state and bounded event history when available.',
-    inputSchema: { type: 'object' as const, properties: { pluginId: { type: 'string', description: 'Plugin ID' }, since: { type: 'number', description: 'Only return events at or after this timestamp' }, limit: { type: 'number', description: 'Maximum events to return (default and maximum: 200)' } }, required: ['pluginId'] },
+    description: 'Read plugin diagnostics.',
+    inputSchema: { type: 'object' as const, properties: { pluginId: { type: 'string', description: 'Plugin ID' }, since: { type: 'number', description: 'Only return events at or after this timestamp' }, limit: { type: 'number', description: 'Maximum events to return (default 25, maximum 200)' }, detail: { type: 'string', enum: ['summary', 'full'], description: 'summary previews diagnostic values (default)' } }, required: ['pluginId'] },
   },
   {
     name: 'obsidian_get_store_state',
-    description:
-      'Read Svelte store values from a plugin. Returns current state of reactive stores.',
+    description: 'Read plugin store state.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -569,14 +594,14 @@ const allTools = [
           description:
             'Specific store name (e.g., "syncState"), or omit for all known stores',
         },
+        detail: { type: 'string', enum: ['summary', 'full'], description: 'summary previews store values (default)' },
       },
       required: ['pluginId'],
     },
   },
   {
     name: 'obsidian_call_plugin_mcp',
-    description:
-      "Call an MCP tool through a plugin's embedded MCP client (e.g., doc-doctor's dd-mcp tools).",
+    description: 'Call a plugin’s embedded MCP tool.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -593,13 +618,14 @@ const allTools = [
           type: 'object',
           description: 'Tool arguments as key-value pairs',
         },
+        detail: { type: 'string', enum: ['summary', 'full'], description: 'summary previews the plugin MCP result (default)' },
       },
       required: ['pluginId', 'toolName'],
     },
   },
   {
     name: 'obsidian_capture_screenshot',
-    description: 'Capture a screenshot of Obsidian window or a specific element.',
+    description: 'Capture a viewport or element screenshot.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -765,9 +791,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'obsidian_get_console_logs': {
+        const detail = detailOf(args as Record<string, unknown> | undefined);
         const logs = obsidian.getConsoleLogs({
           level: args?.level as 'log' | 'warn' | 'error' | 'info' | 'debug' | 'all',
-          limit: args?.limit as number,
+          limit: (args?.limit as number | undefined) ?? (detail === 'summary' ? 50 : undefined),
           since: args?.since as number,
           clear: args?.clear as boolean,
         });
@@ -777,15 +804,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: 'text',
               text: toolText(
-                logs.map((l) => ({
+                { count: logs.length, logs: logs.map((l) => ({
                   firstSeen: new Date(l.timestamp).toISOString(),
                   lastSeen: new Date(l.lastTimestamp).toISOString(),
                   count: l.repeatCount,
                   targetId: l.targetId,
                   level: l.level,
                   message: l.message,
-                  stackTrace: l.stackTrace,
-                })),
+                  ...(detail === 'full' ? { stackTrace: l.stackTrace } : {}),
+                })) },
               ),
             },
           ],
@@ -817,7 +844,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!id) throw new Error('id is required');
         const result = await obsidian.readProbe(id, {
           since: args?.since as number | undefined,
-          limit: args?.limit as number | undefined,
+          limit: (args?.limit as number | undefined) ?? 50,
           clear: args?.clear as boolean | undefined,
           includeRaw: args?.includeRaw as boolean | undefined,
         }, args?.targetId as string | undefined);
@@ -863,7 +890,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const capture = bugWindows.get(id);
         if (!capture) throw new Error(`No active bug window named: ${id}`);
         const endedAt = Date.now();
-        const eventLimit = Math.max(1, Math.min(1000, Math.floor((args?.eventLimit as number | undefined) ?? 200)));
+        const eventLimit = Math.max(1, Math.min(1000, Math.floor((args?.eventLimit as number | undefined) ?? 50)));
         const detail = (args?.detail as 'summary' | 'timeline' | 'sources' | undefined) ?? 'timeline';
         const probe = await obsidian.readProbe(id, { since: capture.startedAt, limit: eventLimit }, capture.targetId) as {
           events?: Array<{ timestamp: number; lastTimestamp?: number; count?: number; data: unknown }>;
@@ -915,7 +942,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'obsidian_get_diagnostic_timeline': {
         const since = args?.since as number | undefined;
-        const limit = Math.max(1, Math.min(1000, Math.floor((args?.limit as number | undefined) ?? 200)));
+        const limit = Math.max(1, Math.min(1000, Math.floor((args?.limit as number | undefined) ?? 50)));
         const targetId = args?.targetId as string | undefined;
         const probeId = args?.probeId as string | undefined;
         const pluginId = args?.pluginId as string | undefined;
@@ -1013,8 +1040,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'obsidian_get_excalidraw_state': {
         const file = args?.file as string | undefined;
+        const detail = detailOf(args as Record<string, unknown> | undefined);
         const result = await obsidian.evaluateInTarget(`(() => {
           const wanted = ${JSON.stringify(file ?? null)};
+          const includeElements = ${detail === 'full'};
           const safeElement = (el) => ({
             id: el.id, type: el.type, x: el.x, y: el.y, width: el.width, height: el.height,
             angle: el.angle, fileId: el.fileId ?? null, crop: el.crop ?? null,
@@ -1036,9 +1065,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const ids = [...new Set([...Object.keys(liveById), ...Object.keys(persistedById)])];
             const differences = ids.filter(id => JSON.stringify(liveById[id] ?? null) !== JSON.stringify(persistedById[id] ?? null));
             rows.push({ path, viewType: view.getViewType?.() ?? null, liveElementCount: live.length,
-              persistedElementCount: persisted.length, liveFileIds: Object.keys(liveFiles),
-              persistedFileIds: Object.keys(persistedFiles), differences,
-              elements: { live: live.map(safeElement), persisted: persisted.map(safeElement) } });
+              persistedElementCount: persisted.length,
+              ...(includeElements
+                ? { liveFileIds: Object.keys(liveFiles), persistedFileIds: Object.keys(persistedFiles), differences }
+                : { liveFileCount: Object.keys(liveFiles).length, persistedFileCount: Object.keys(persistedFiles).length,
+                    differenceCount: differences.length, differenceIds: differences.slice(0, 50), differencesTruncated: differences.length > 50 }),
+              ...(includeElements ? { elements: { live: live.map(safeElement), persisted: persisted.map(safeElement) } } : {}) });
           });
           return rows;
         })()`, args?.targetId as string | undefined);
@@ -1047,6 +1079,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'obsidian_get_plugin_info': {
         const pluginId = args?.pluginId as string | undefined;
+        const detail = detailOf(args as Record<string, unknown> | undefined);
 
         const result = await obsidian.evaluate(`
           (function() {
@@ -1060,7 +1093,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               if (!manifest) return { error: 'Plugin not found: ' + id };
               return {
                 id,
-                manifest,
+                ...( ${detail === 'full'} ? { manifest } : { name: manifest.name, version: manifest.version, author: manifest.author ?? null }),
                 enabled: enabled.includes(id),
                 loaded: !!plugins[id]
               };
@@ -1083,19 +1116,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'obsidian_list_commands': {
         const filter = args?.filter as string | undefined;
+        const limit = Math.max(1, Math.min(200, Math.floor((args?.limit as number | undefined) ?? 50)));
 
         const result = await obsidian.evaluate(`
           (function() {
             const commands = app.commands.commands;
             const filter = ${filter ? JSON.stringify(filter.toLowerCase()) : 'null'};
 
-            return Object.values(commands)
+            const matches = Object.values(commands)
               .filter(cmd => !filter || cmd.name.toLowerCase().includes(filter))
               .map(cmd => ({
                 id: cmd.id,
                 name: cmd.name
               }))
               .sort((a, b) => a.name.localeCompare(b.name));
+            return { count: matches.length, commands: matches.slice(0, ${limit}), truncated: matches.length > ${limit} };
           })()
         `);
 
@@ -1188,6 +1223,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'obsidian_get_plugin_settings': {
         const pluginId = args?.pluginId as string;
+        const detail = detailOf(args as Record<string, unknown> | undefined);
         if (!pluginId) {
           throw new Error('pluginId is required');
         }
@@ -1198,7 +1234,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!plugin) {
               return { error: 'Plugin not loaded: ' + ${JSON.stringify(pluginId)} };
             }
-            return plugin.settings || {};
+            const settings = plugin.settings || {};
+            if (${detail === 'full'}) return settings;
+            const keys = Object.keys(settings);
+            return { pluginId: ${JSON.stringify(pluginId)}, settingCount: keys.length, keys: keys.slice(0, 50), preview: Object.fromEntries(keys.slice(0, 10).map(key => [key, typeof settings[key]])) };
           })()
         `);
 
@@ -1210,10 +1249,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'obsidian_get_plugin_diagnostics': {
         const pluginId = args?.pluginId as string;
         if (!pluginId) throw new Error('pluginId is required');
+        const detail = detailOf(args as Record<string, unknown> | undefined);
         const since = args?.since as number | undefined;
         const requestedLimit = args?.limit as number | undefined;
         const limit = requestedLimit == null || !Number.isFinite(requestedLimit)
-          ? 200
+          ? 25
           : Math.max(0, Math.min(200, Math.floor(requestedLimit)));
         const eventSlice = limit === 0 ? 'events.slice(0, 0)' : `events.slice(-${limit})`;
         const result = await obsidian.evaluate(`(() => {
@@ -1230,12 +1270,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
           return { supported: true, value };
         })()`);
-        return { content: [{ type: 'text', text: toolText(result) }] };
+        return { content: [{ type: 'text', text: toolText(detail === 'full' ? result : summarizeValue(result)) }] };
       }
 
       case 'obsidian_get_store_state': {
         const pluginId = args?.pluginId as string;
         const storeName = args?.storeName as string | undefined;
+        const detail = detailOf(args as Record<string, unknown> | undefined);
 
         if (!pluginId) {
           throw new Error('pluginId is required');
@@ -1300,7 +1341,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `);
 
         return {
-          content: [{ type: 'text', text: toolText(result) }],
+          content: [{ type: 'text', text: toolText(detail === 'full' ? result : summarizeValue(result)) }],
         };
       }
 
@@ -1308,6 +1349,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const pluginId = args?.pluginId as string;
         const toolName = args?.toolName as string;
         const toolArgs = (args?.arguments as Record<string, unknown>) || {};
+        const detail = detailOf(args as Record<string, unknown> | undefined);
 
         if (!pluginId) throw new Error('pluginId is required');
         if (!toolName) throw new Error('toolName is required');
@@ -1341,7 +1383,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `);
 
         return {
-          content: [{ type: 'text', text: toolText(result) }],
+          content: [{ type: 'text', text: toolText(detail === 'full' ? result : summarizeValue(result)) }],
         };
       }
 

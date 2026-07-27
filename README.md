@@ -88,6 +88,16 @@ Use obsidian_discover_tools for "debug an Excalidraw popout", then enable the re
 
 The complete catalog, shown below, is available through these toolsets.
 
+### Concise responses by default
+
+Inspection tools favor small, decision-ready responses: console reads return at
+most 50 recent messages without stack traces, event and timeline reads default
+to 50 entries, command lists default to 50 commands, and plugin settings,
+stores, diagnostics, plugin-MCP results, and Excalidraw state return summaries.
+Pass `detail: "full"` when a tool supports it, or raise its `limit` only for the
+specific evidence you need. All tool text is compact JSON and has a 12,000
+character final safety cap.
+
 For maintainers, profile membership and task matching live in
 [`src/tool-registry.ts`](src/tool-registry.ts); add or reclassify a tool there
 instead of duplicating its discovery rules in the request handler.
