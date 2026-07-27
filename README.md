@@ -169,6 +169,12 @@ zero-sized or file-backed elements whose live file entry is missing. Pass
 `keepOpen: true` when you want to capture another reproduction with the same
 window.
 
+Excalidraw watchers and bug windows use compact noise control by default. Rapid
+updates to the same element become one action with `callbacks`, `durationMs`,
+and before/after geometry; selection and zoom-only callbacks become compact
+`ui-noise` runs. Use `obsidian_watch_excalidraw({ noise: "all", ... })` only
+when callback-level timing is important.
+
 ## Renderer vs. main process (important)
 
 `obsidian_execute_js` evaluates in Obsidian's **renderer** (the CDP target is the page). `app`, `window`, and the DOM live there. To touch the Electron **main process** from the renderer you go through `@electron/remote` — and its proxy has a sharp edge:

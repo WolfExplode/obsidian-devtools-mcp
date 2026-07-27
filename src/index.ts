@@ -69,21 +69,55 @@ function consoleKey(log: ConsoleEntry): string {
   return JSON.stringify([log.level, log.message, log.stackTrace]);
 }
 
-function excalidrawWatcherInstaller(file: string): string {
+function excalidrawWatcherInstaller(file: string, noise: 'compact' | 'all' = 'compact'): string {
   return `(emit) => {
     const path = ${JSON.stringify(file)};
+    const noise = ${JSON.stringify(noise)};
     const leaf = app.workspace.getLeavesOfType('excalidraw').find(l => l.view?.file?.path === path);
     const api = leaf?.view?.excalidrawAPI;
     if (!api) throw new Error('Active Excalidraw API unavailable for ' + path);
     let previous;
+    let pending = null;
+    const DEBOUNCE_MS = 250;
+    const flush = () => {
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      emit(pending.event, pending.original);
+      pending = null;
+    };
+    const enqueue = (key, event, original) => {
+      if (noise === 'all') { emit(event, original); return; }
+      if (pending?.key === key) {
+        pending.event.callbacks += 1;
+        pending.event.durationMs = Date.now() - pending.startedAt;
+        if (event.after) pending.event.after = event.after;
+        if (event.selectedCount != null) {
+          pending.event.selectedCountRange[0] = Math.min(pending.event.selectedCountRange[0], event.selectedCount);
+          pending.event.selectedCountRange[1] = Math.max(pending.event.selectedCountRange[1], event.selectedCount);
+        }
+        if (event.zoom != null) {
+          pending.event.zoomRange[0] = Math.min(pending.event.zoomRange[0], event.zoom);
+          pending.event.zoomRange[1] = Math.max(pending.event.zoomRange[1], event.zoom);
+        }
+        clearTimeout(pending.timer);
+        pending.timer = setTimeout(flush, DEBOUNCE_MS);
+        return;
+      }
+      flush();
+      const startedAt = Date.now();
+      pending = { key, startedAt, original, event: { ...event, callbacks: 1, durationMs: 0,
+        selectedCountRange: [event.selectedCount ?? 0, event.selectedCount ?? 0],
+        zoomRange: [event.zoom ?? 0, event.zoom ?? 0] }, timer: setTimeout(flush, DEBOUNCE_MS) };
+    };
     const snapshot = (elements, appState, files) => {
       const active = (elements || []).filter(e => !e.isDeleted);
       const fingerprints = Object.fromEntries(active.map(e => [e.id, [e.version, e.versionNonce, e.type, e.x, e.y, e.width, e.height, e.fileId || null].join(':')]));
+      const details = Object.fromEntries(active.map(e => [e.id, { type: e.type, x: e.x, y: e.y, width: e.width, height: e.height, angle: e.angle, fileId: e.fileId || null }]));
       return {
         elementCount: active.length,
         deletedCount: (elements || []).length - active.length,
         fileCount: files ? Object.keys(files).length : 0,
-        fingerprints,
+        fingerprints, details,
         selectedCount: Object.values(appState?.selectedElementIds || {}).filter(Boolean).length,
         tool: appState?.activeTool?.type || null,
         zoom: appState?.zoom?.value || null,
@@ -96,16 +130,31 @@ function excalidrawWatcherInstaller(file: string): string {
       const added = Object.keys(after).filter(id => !(id in before));
       const removed = Object.keys(before).filter(id => !(id in after));
       const changed = Object.keys(after).filter(id => id in before && before[id] !== after[id]);
-      emit({
-        kind: previous ? 'scene-change' : 'scene-baseline', path,
-        elementCount: current.elementCount, deletedCount: current.deletedCount, fileCount: current.fileCount,
-        fileDelta: previous ? current.fileCount - previous.fileCount : 0,
-        elementsAdded: added, elementsRemoved: removed, elementsChanged: changed,
-        selectedCount: current.selectedCount, tool: current.tool, zoom: current.zoom,
-      }, { path, elements, appState, files });
+      if (!previous) {
+        emit({ kind: 'scene-baseline', path,
+          elementCount: current.elementCount, deletedCount: current.deletedCount, fileCount: current.fileCount,
+          selectedCount: current.selectedCount, tool: current.tool, zoom: current.zoom }, { path, elements, appState, files });
+      } else if (added.length || removed.length || changed.length || current.fileCount !== previous.fileCount) {
+        const ids = [...added, ...removed, ...changed].sort();
+        const before = Object.fromEntries(ids.map(id => [id, previous.details[id] ?? null]));
+        const after = Object.fromEntries(ids.map(id => [id, current.details[id] ?? null]));
+        const kind = added.length || removed.length ? 'scene-structure' : 'element-update';
+        enqueue(kind + ':' + ids.join(','), {
+          kind, path,
+          elementCount: current.elementCount, deletedCount: current.deletedCount, fileCount: current.fileCount,
+          fileDelta: current.fileCount - previous.fileCount,
+          elementsAdded: added, elementsRemoved: removed, elementsChanged: changed,
+          before, after, selectedCount: current.selectedCount, tool: current.tool, zoom: current.zoom,
+        }, { path, elements, appState, files });
+      } else {
+        enqueue('ui:' + current.tool, {
+          kind: 'ui-noise', path, action: current.tool,
+          selectedCount: current.selectedCount, zoom: current.zoom,
+        }, { path, elements, appState, files });
+      }
       previous = current;
     });
-    return () => unsubscribe?.();
+    return () => { flush(); unsubscribe?.(); };
   }`;
 }
 
@@ -258,13 +307,14 @@ const tools = [
   },
   {
     name: 'obsidian_watch_excalidraw',
-    description: 'Install an Excalidraw scene watcher that coalesces equivalent changes and reports element/file/app-state deltas. Enable captureRaw to preserve full scene callback payloads for selected events.',
+    description: 'Install an Excalidraw scene watcher. Compact mode (default) collapses rapid edits into actions and condenses selection/zoom-only callbacks; all mode exposes every callback.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         id: { type: 'string', description: 'Probe identifier' },
         file: { type: 'string', description: 'Excalidraw file path' },
         maxEvents: { type: 'number', description: 'Maximum buffered events (default 500)' },
+        noise: { type: 'string', enum: ['compact', 'all'], description: 'Output detail for UI-only callbacks (default compact)' },
         captureRaw: { type: 'boolean', description: 'Preserve original elements, app state, and files as raw JSON; disables coalescing by default' },
         targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
       },
@@ -684,43 +734,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const id = args?.id as string;
         const file = args?.file as string;
         if (!id || !file) throw new Error('id and file are required');
-        const installer = `(emit) => {
-          const path = ${JSON.stringify(file)};
-          const leaf = app.workspace.getLeavesOfType('excalidraw').find(l => l.view?.file?.path === path);
-          const api = leaf?.view?.excalidrawAPI;
-          if (!api) throw new Error('Active Excalidraw API unavailable for ' + path);
-          let previous;
-          const snapshot = (elements, appState, files) => {
-            const active = (elements || []).filter(e => !e.isDeleted);
-            const fingerprints = Object.fromEntries(active.map(e => [e.id, [e.version, e.versionNonce, e.type, e.x, e.y, e.width, e.height, e.fileId || null].join(':')]));
-            return {
-              elementCount: active.length,
-              deletedCount: (elements || []).length - active.length,
-              fileCount: files ? Object.keys(files).length : 0,
-              fingerprints,
-              selectedCount: Object.values(appState?.selectedElementIds || {}).filter(Boolean).length,
-              tool: appState?.activeTool?.type || null,
-              zoom: appState?.zoom?.value || null,
-            };
-          };
-          const unsubscribe = api.onChange((elements, appState, files) => {
-            const current = snapshot(elements, appState, files);
-            const before = previous?.fingerprints || {};
-            const after = current.fingerprints;
-            const added = Object.keys(after).filter(id => !(id in before));
-            const removed = Object.keys(before).filter(id => !(id in after));
-            const changed = Object.keys(after).filter(id => id in before && before[id] !== after[id]);
-            emit({
-              kind: previous ? 'scene-change' : 'scene-baseline', path,
-              elementCount: current.elementCount, deletedCount: current.deletedCount, fileCount: current.fileCount,
-              fileDelta: previous ? current.fileCount - previous.fileCount : 0,
-              elementsAdded: added, elementsRemoved: removed, elementsChanged: changed,
-              selectedCount: current.selectedCount, tool: current.tool, zoom: current.zoom,
-            }, { path, elements, appState, files });
-            previous = current;
-          });
-          return () => unsubscribe?.();
-        }`;
+        const noise = (args?.noise as 'compact' | 'all' | undefined) ?? 'compact';
+        const installer = excalidrawWatcherInstaller(file, noise);
         const result = await obsidian.installProbe(id, installer, args?.maxEvents as number | undefined, args?.targetId as string | undefined, {
           captureRaw: args?.captureRaw as boolean | undefined,
         });
