@@ -13,6 +13,8 @@ interface StackTrace {
 
 export interface ConsoleEntry {
   timestamp: number;
+  lastTimestamp: number;
+  repeatCount: number;
   level: string;
   message: string;
   args: unknown[];
@@ -26,8 +28,12 @@ export interface ObsidianInfo {
 }
 
 export interface ProbeEvent {
+  sequence?: number;
   timestamp: number;
+  lastTimestamp?: number;
+  count?: number;
   data: unknown;
+  rawData?: string;
 }
 
 export class ObsidianConnection {
@@ -107,8 +113,11 @@ export class ObsidianConnection {
               })),
           }
         : undefined;
-      this.consoleLogs.push({
-        timestamp: Date.now(),
+      const timestamp = Date.now();
+      const entry: ConsoleEntry = {
+        timestamp,
+        lastTimestamp: timestamp,
+        repeatCount: 1,
         level: params.type,
         message: message.length > this.MAX_LOG_MESSAGE_CHARS
           ? message.slice(0, this.MAX_LOG_MESSAGE_CHARS) + '…'
@@ -117,7 +126,20 @@ export class ObsidianConnection {
         // plus a compact stack trace preserves useful diagnostic context.
         args: [],
         stackTrace,
-      });
+      };
+      // Group by message and stack signature even when other logs interleave.
+      // This makes render-loop failures readable without losing frequency/timing.
+      const matching = this.consoleLogs.find((existing) =>
+        existing.level === entry.level &&
+        existing.message === entry.message &&
+        JSON.stringify(existing.stackTrace) === JSON.stringify(entry.stackTrace)
+      );
+      if (matching) {
+        matching.repeatCount += 1;
+        matching.lastTimestamp = timestamp;
+      } else {
+        this.consoleLogs.push(entry);
+      }
 
       // Keep buffer bounded
       if (this.consoleLogs.length > this.MAX_LOG_ENTRIES) {
@@ -344,16 +366,30 @@ export class ObsidianConnection {
   }
 
   /** Install a named, disposable event probe in the renderer realm. */
-  async installProbe(id: string, installer: string, maxEvents = 500, targetId?: string): Promise<unknown> {
+  async installProbe(
+    id: string,
+    installer: string,
+    maxEvents = 500,
+    targetId?: string,
+    options?: { captureRaw?: boolean; maxRawEventBytes?: number; coalesce?: boolean },
+  ): Promise<unknown> {
     if (!/^[A-Za-z0-9_.:-]+$/.test(id)) throw new Error('Probe id contains invalid characters');
     if (!installer.trim()) throw new Error('installer is required');
     const boundedMax = Number.isFinite(maxEvents)
       ? Math.max(1, Math.min(10000, Math.floor(maxEvents)))
       : 500;
+    const captureRaw = options?.captureRaw === true;
+    const maxRawEventBytes = Number.isFinite(options?.maxRawEventBytes)
+      ? Math.max(1024, Math.min(1024 * 1024, Math.floor(options!.maxRawEventBytes!)))
+      : 64 * 1024;
+    const coalesce = options?.coalesce ?? !captureRaw;
     return this.evaluateInTarget(`
       (() => {
         const id = ${JSON.stringify(id)};
         const maxEvents = ${boundedMax};
+        const captureRaw = ${captureRaw};
+        const maxRawEventBytes = ${maxRawEventBytes};
+        const coalesce = ${coalesce};
         const root = window.__obsidianDevtoolsProbes ||= Object.create(null);
         if (root[id]) { try { root[id].dispose(); } catch (_) {} }
         const events = [];
@@ -414,21 +450,42 @@ export class ObsidianConnection {
             count: Array.isArray(value) ? value.length : undefined,
           };
         };
-        const emit = (data) => {
-          events.push({ timestamp: Date.now(), data: safe(data) });
+        let sequence = 0;
+        const emit = (data, originalData = data) => {
+          const timestamp = Date.now();
+          const normalized = safe(data);
+          const signature = JSON.stringify(normalized);
+          let rawData;
+          if (captureRaw) {
+            try {
+              rawData = JSON.stringify(originalData);
+              if (rawData.length > maxRawEventBytes) {
+                rawData = JSON.stringify({ truncated: true, reason: 'max-raw-event-bytes', originalBytes: rawData.length, sample: rawData.slice(0, maxRawEventBytes) });
+              }
+            } catch (_) {
+              rawData = JSON.stringify({ truncated: true, reason: 'raw-serialization-failed', type: typeof originalData });
+            }
+          }
+          const previous = events.at(-1);
+          if (coalesce && previous?.signature === signature) {
+            previous.count += 1;
+            previous.lastTimestamp = timestamp;
+            return;
+          }
+          events.push({ sequence: ++sequence, timestamp, lastTimestamp: timestamp, count: 1, data: normalized, rawData, signature });
           if (events.length > maxEvents) events.splice(0, events.length - maxEvents);
         };
         const factory = (${installer});
         if (typeof factory !== 'function') throw new Error('installer must evaluate to a function');
         const disposer = factory(emit);
         if (typeof disposer !== 'function') throw new Error('installer must return a disposer function');
-        root[id] = { createdAt: Date.now(), maxEvents, events, dispose: disposer };
-        return { id, installed: true, maxEvents };
+        root[id] = { createdAt: Date.now(), maxEvents, captureRaw, maxRawEventBytes, coalesce, events, dispose: disposer };
+        return { id, installed: true, maxEvents, captureRaw, coalesce };
       })()
     `, targetId);
   }
 
-  async readProbe(id: string, options?: { since?: number; limit?: number; clear?: boolean }, targetId?: string): Promise<unknown> {
+  async readProbe(id: string, options?: { since?: number; limit?: number; clear?: boolean; includeRaw?: boolean }, targetId?: string): Promise<unknown> {
     const limit = options?.limit == null ? null : Math.max(1, Math.min(10000, Math.floor(options.limit)));
     return this.evaluateInTarget(`
       (() => {
@@ -437,6 +494,7 @@ export class ObsidianConnection {
         let events = probe.events.slice();
         ${options?.since != null ? `events = events.filter(e => e.timestamp >= ${Math.floor(options.since)});` : ''}
         ${limit != null ? `events = events.slice(-${limit});` : ''}
+        events = events.map(({ signature, rawData, ...event }) => ${options?.includeRaw ? 'rawData === undefined ? event : { ...event, rawData }' : 'event'});
         const result = { id: ${JSON.stringify(id)}, installed: true, createdAt: probe.createdAt, events };
         ${options?.clear ? 'probe.events.length = 0;' : ''}
         return result;
@@ -459,7 +517,8 @@ export class ObsidianConnection {
   async listProbes(targetId?: string): Promise<unknown> {
     return this.evaluateInTarget(`
       (() => Object.entries(window.__obsidianDevtoolsProbes || {}).map(([id, probe]) => ({
-        id, createdAt: probe.createdAt, bufferedEvents: probe.events.length, maxEvents: probe.maxEvents
+        id, createdAt: probe.createdAt, bufferedEvents: probe.events.length, maxEvents: probe.maxEvents,
+        captureRaw: probe.captureRaw, coalesce: probe.coalesce
       })))()
     `, targetId);
   }

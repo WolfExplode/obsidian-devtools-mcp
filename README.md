@@ -69,8 +69,10 @@ Reload the "doc-doctor" plugin and show any console errors.
 | `obsidian_reload_plugin` | Reload a plugin by ID |
 | `obsidian_get_console_logs` | Get buffered console output and compact stack traces when available |
 | `obsidian_clear_console_logs` | Clear the log buffer |
-| `obsidian_install_probe` | Install a named disposable renderer listener/probe |
-| `obsidian_read_probe` | Read/filter/clear buffered probe events |
+| `obsidian_install_probe` | Install a named disposable renderer listener/probe, with optional raw-payload preservation and coalescing |
+| `obsidian_read_probe` | Read/filter/clear buffered probe events, optionally including preserved raw payload JSON |
+| `obsidian_watch_excalidraw` | Watch an Excalidraw scene and report coalesced element, file, and app-state deltas |
+| `obsidian_get_diagnostic_timeline` | Merge probe events, grouped console logs, and plugin diagnostic events by time |
 | `obsidian_remove_probe` | Dispose and remove a probe |
 | `obsidian_list_probes` | List installed probes and buffer sizes |
 | `obsidian_execute_js` | Run arbitrary JavaScript in the **renderer** |

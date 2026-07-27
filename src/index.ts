@@ -144,6 +144,9 @@ const tools = [
             'JavaScript function expression, e.g. (emit) => { const ref = app.vault.on("modify", f => emit({path:f.path})); return () => app.vault.offref(ref); }',
         },
         maxEvents: { type: 'number', description: 'Maximum buffered events (default 500, maximum 10000)' },
+        captureRaw: { type: 'boolean', description: 'Preserve original JSON payloads for later retrieval; disables event coalescing by default' },
+        maxRawEventBytes: { type: 'number', description: 'Maximum bytes per preserved raw payload (default 65536, maximum 1048576)' },
+        coalesce: { type: 'boolean', description: 'Coalesce consecutive equivalent summarized events (default true unless captureRaw is enabled)' },
         targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
       },
       required: ['id', 'installer'],
@@ -159,9 +162,39 @@ const tools = [
         since: { type: 'number', description: 'Only events at or after this Unix timestamp in milliseconds' },
         limit: { type: 'number', description: 'Return only the most recent N events' },
         clear: { type: 'boolean', description: 'Clear the probe buffer after reading' },
+        includeRaw: { type: 'boolean', description: 'Include opt-in preserved raw payload JSON' },
         targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
       },
       required: ['id'],
+    },
+  },
+  {
+    name: 'obsidian_watch_excalidraw',
+    description: 'Install an Excalidraw scene watcher that coalesces equivalent changes and reports element/file/app-state deltas. Enable captureRaw to preserve full scene callback payloads for selected events.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        id: { type: 'string', description: 'Probe identifier' },
+        file: { type: 'string', description: 'Excalidraw file path' },
+        maxEvents: { type: 'number', description: 'Maximum buffered events (default 500)' },
+        captureRaw: { type: 'boolean', description: 'Preserve original elements, app state, and files as raw JSON; disables coalescing by default' },
+        targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
+      },
+      required: ['id', 'file'],
+    },
+  },
+  {
+    name: 'obsidian_get_diagnostic_timeline',
+    description: 'Merge buffered probe events, grouped console logs, and optional plugin diagnostic events into a timestamp-sorted timeline.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        probeId: { type: 'string', description: 'Optional probe whose events to include' },
+        pluginId: { type: 'string', description: 'Optional plugin whose getDiagnostics().events to include' },
+        since: { type: 'number', description: 'Only include entries at or after this Unix timestamp in milliseconds' },
+        limit: { type: 'number', description: 'Maximum timeline entries (default 200, maximum 1000)' },
+        targetId: { type: 'string', description: 'CDP target ID for probe/plugin lookup' },
+      },
     },
   },
   {
@@ -487,7 +520,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               type: 'text',
               text: toolText(
                 logs.map((l) => ({
-                  time: new Date(l.timestamp).toISOString(),
+                  firstSeen: new Date(l.timestamp).toISOString(),
+                  lastSeen: new Date(l.lastTimestamp).toISOString(),
+                  count: l.repeatCount,
                   level: l.level,
                   message: l.message,
                   stackTrace: l.stackTrace,
@@ -510,7 +545,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const installer = args?.installer as string;
         if (!id) throw new Error('id is required');
         if (!installer) throw new Error('installer is required');
-        const result = await obsidian.installProbe(id, installer, args?.maxEvents as number | undefined, args?.targetId as string | undefined);
+        const result = await obsidian.installProbe(id, installer, args?.maxEvents as number | undefined, args?.targetId as string | undefined, {
+          captureRaw: args?.captureRaw as boolean | undefined,
+          maxRawEventBytes: args?.maxRawEventBytes as number | undefined,
+          coalesce: args?.coalesce as boolean | undefined,
+        });
         return { content: [{ type: 'text', text: toolText(result) }] };
       }
 
@@ -521,8 +560,76 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           since: args?.since as number | undefined,
           limit: args?.limit as number | undefined,
           clear: args?.clear as boolean | undefined,
+          includeRaw: args?.includeRaw as boolean | undefined,
         }, args?.targetId as string | undefined);
         return { content: [{ type: 'text', text: toolText(result) }] };
+      }
+
+      case 'obsidian_watch_excalidraw': {
+        const id = args?.id as string;
+        const file = args?.file as string;
+        if (!id || !file) throw new Error('id and file are required');
+        const installer = `(emit) => {
+          const path = ${JSON.stringify(file)};
+          const leaf = app.workspace.getLeavesOfType('excalidraw').find(l => l.view?.file?.path === path);
+          const api = leaf?.view?.excalidrawAPI;
+          if (!api) throw new Error('Active Excalidraw API unavailable for ' + path);
+          let previous;
+          const snapshot = (elements, appState, files) => {
+            const active = (elements || []).filter(e => !e.isDeleted);
+            const fingerprints = Object.fromEntries(active.map(e => [e.id, [e.version, e.versionNonce, e.type, e.x, e.y, e.width, e.height, e.fileId || null].join(':')]));
+            return {
+              elementCount: active.length,
+              deletedCount: (elements || []).length - active.length,
+              fileCount: files ? Object.keys(files).length : 0,
+              fingerprints,
+              selectedCount: Object.values(appState?.selectedElementIds || {}).filter(Boolean).length,
+              tool: appState?.activeTool?.type || null,
+              zoom: appState?.zoom?.value || null,
+            };
+          };
+          const unsubscribe = api.onChange((elements, appState, files) => {
+            const current = snapshot(elements, appState, files);
+            const before = previous?.fingerprints || {};
+            const after = current.fingerprints;
+            const added = Object.keys(after).filter(id => !(id in before));
+            const removed = Object.keys(before).filter(id => !(id in after));
+            const changed = Object.keys(after).filter(id => id in before && before[id] !== after[id]);
+            emit({
+              kind: previous ? 'scene-change' : 'scene-baseline', path,
+              elementCount: current.elementCount, deletedCount: current.deletedCount, fileCount: current.fileCount,
+              fileDelta: previous ? current.fileCount - previous.fileCount : 0,
+              elementsAdded: added, elementsRemoved: removed, elementsChanged: changed,
+              selectedCount: current.selectedCount, tool: current.tool, zoom: current.zoom,
+            }, { path, elements, appState, files });
+            previous = current;
+          });
+          return () => unsubscribe?.();
+        }`;
+        const result = await obsidian.installProbe(id, installer, args?.maxEvents as number | undefined, args?.targetId as string | undefined, {
+          captureRaw: args?.captureRaw as boolean | undefined,
+        });
+        return { content: [{ type: 'text', text: toolText(result) }] };
+      }
+
+      case 'obsidian_get_diagnostic_timeline': {
+        const since = args?.since as number | undefined;
+        const limit = Math.max(1, Math.min(1000, Math.floor((args?.limit as number | undefined) ?? 200)));
+        const targetId = args?.targetId as string | undefined;
+        const probeId = args?.probeId as string | undefined;
+        const pluginId = args?.pluginId as string | undefined;
+        const probe = probeId ? await obsidian.readProbe(probeId, { since, limit }, targetId) as { events?: Array<{ timestamp: number; lastTimestamp?: number; count?: number; data: unknown }> } : undefined;
+        const pluginEvents = pluginId ? await obsidian.evaluateInTarget<Array<{ timestamp?: number; [key: string]: unknown }>>(`(() => {
+          const plugin = app.plugins.plugins[${JSON.stringify(pluginId)}];
+          const value = plugin?.getDiagnostics?.();
+          return Array.isArray(value?.events) ? value.events : [];
+        })()`, targetId) : [];
+        const timeline = [
+          ...(probe?.events || []).map(event => ({ source: 'probe', timestamp: event.timestamp, lastTimestamp: event.lastTimestamp, count: event.count, event: event.data })),
+          ...obsidian.getConsoleLogs({ since, limit: 300 }).map(log => ({ source: 'console', timestamp: log.timestamp, lastTimestamp: log.lastTimestamp, count: log.repeatCount, level: log.level, message: log.message, stackTrace: log.stackTrace })),
+          ...pluginEvents.filter(event => typeof event.timestamp === 'number' && (since == null || event.timestamp >= since)).map(event => ({ source: 'plugin', timestamp: event.timestamp as number, event })),
+        ].sort((a, b) => a.timestamp - b.timestamp).slice(-limit);
+        return { content: [{ type: 'text', text: toolText({ timeline, sources: { probeId, pluginId } }) }] };
       }
 
       case 'obsidian_remove_probe': {
