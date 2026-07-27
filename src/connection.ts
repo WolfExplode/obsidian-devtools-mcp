@@ -334,7 +334,10 @@ export class ObsidianConnection {
 
     // Filter by timestamp
     if (options?.since) {
-      logs = logs.filter((log) => log.timestamp >= options.since!);
+      // Grouped entries can begin before a capture window and continue inside
+      // it. Their final occurrence, rather than only their first, determines
+      // whether they are relevant to a time-bounded diagnostic report.
+      logs = logs.filter((log) => log.lastTimestamp >= options.since!);
     }
 
     // Filter by level

@@ -6,7 +6,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { writeFile } from 'fs/promises';
-import { obsidian } from './connection.js';
+import { obsidian, type ConsoleEntry } from './connection.js';
 
 // MCP responses become model context. Keep ordinary diagnostic responses useful
 // but bounded; callers can still use execute_js to request a deliberately
@@ -51,6 +51,94 @@ const server = new Server(
   { name: 'obsidian-devtools-mcp', version: '1.0.0' },
   { capabilities: { tools: {} } }
 );
+
+type BugWindow = {
+  id: string;
+  file: string;
+  startedAt: number;
+  targetId?: string;
+  baseline: unknown;
+  consoleCounts: Map<string, number>;
+};
+
+// Bug windows intentionally live only for the MCP process lifetime. They are
+// disposable diagnostic sessions, not user data or durable application state.
+const bugWindows = new Map<string, BugWindow>();
+
+function consoleKey(log: ConsoleEntry): string {
+  return JSON.stringify([log.level, log.message, log.stackTrace]);
+}
+
+function excalidrawWatcherInstaller(file: string): string {
+  return `(emit) => {
+    const path = ${JSON.stringify(file)};
+    const leaf = app.workspace.getLeavesOfType('excalidraw').find(l => l.view?.file?.path === path);
+    const api = leaf?.view?.excalidrawAPI;
+    if (!api) throw new Error('Active Excalidraw API unavailable for ' + path);
+    let previous;
+    const snapshot = (elements, appState, files) => {
+      const active = (elements || []).filter(e => !e.isDeleted);
+      const fingerprints = Object.fromEntries(active.map(e => [e.id, [e.version, e.versionNonce, e.type, e.x, e.y, e.width, e.height, e.fileId || null].join(':')]));
+      return {
+        elementCount: active.length,
+        deletedCount: (elements || []).length - active.length,
+        fileCount: files ? Object.keys(files).length : 0,
+        fingerprints,
+        selectedCount: Object.values(appState?.selectedElementIds || {}).filter(Boolean).length,
+        tool: appState?.activeTool?.type || null,
+        zoom: appState?.zoom?.value || null,
+      };
+    };
+    const unsubscribe = api.onChange((elements, appState, files) => {
+      const current = snapshot(elements, appState, files);
+      const before = previous?.fingerprints || {};
+      const after = current.fingerprints;
+      const added = Object.keys(after).filter(id => !(id in before));
+      const removed = Object.keys(before).filter(id => !(id in after));
+      const changed = Object.keys(after).filter(id => id in before && before[id] !== after[id]);
+      emit({
+        kind: previous ? 'scene-change' : 'scene-baseline', path,
+        elementCount: current.elementCount, deletedCount: current.deletedCount, fileCount: current.fileCount,
+        fileDelta: previous ? current.fileCount - previous.fileCount : 0,
+        elementsAdded: added, elementsRemoved: removed, elementsChanged: changed,
+        selectedCount: current.selectedCount, tool: current.tool, zoom: current.zoom,
+      }, { path, elements, appState, files });
+      previous = current;
+    });
+    return () => unsubscribe?.();
+  }`;
+}
+
+async function getExcalidrawSceneSummary(file: string, targetId?: string): Promise<unknown> {
+  return obsidian.evaluateInTarget(`(() => {
+    const path = ${JSON.stringify(file)};
+    const leaf = app.workspace.getLeavesOfType('excalidraw').find(l => l.view?.file?.path === path);
+    const view = leaf?.view;
+    if (!view?.excalidrawAPI) return { path, available: false, reason: 'Active Excalidraw API unavailable' };
+    const live = view.excalidrawAPI.getSceneElements?.() ?? [];
+    const persisted = view.excalidrawData?.scene?.elements ?? [];
+    const files = view.excalidrawAPI.getFiles?.() ?? {};
+    const active = elements => elements.filter(e => !e.isDeleted);
+    const byType = elements => Object.fromEntries(Object.entries(elements.reduce((counts, e) => {
+      counts[e.type] = (counts[e.type] || 0) + 1; return counts;
+    }, {})).sort(([a], [b]) => a.localeCompare(b)));
+    const fingerprint = e => JSON.stringify([e.type, e.version, e.x, e.y, e.width, e.height, e.angle, e.fileId || null, e.crop || null, !!e.isDeleted]);
+    const liveById = Object.fromEntries(live.map(e => [e.id, fingerprint(e)]));
+    const persistedById = Object.fromEntries(persisted.map(e => [e.id, fingerprint(e)]));
+    const ids = [...new Set([...Object.keys(liveById), ...Object.keys(persistedById)])];
+    const differences = ids.filter(id => liveById[id] !== persistedById[id]);
+    const badElements = active(live).filter(e => e.width <= 0 || e.height <= 0 || (e.fileId && !files[e.fileId]))
+      .slice(0, 50).map(e => ({ id: e.id, type: e.type, width: e.width, height: e.height, fileId: e.fileId || null,
+        issue: e.width <= 0 || e.height <= 0 ? 'non-positive-dimension' : 'missing-live-file' }));
+    return {
+      path, available: true,
+      live: { elementCount: live.length, activeElementCount: active(live).length, elementTypes: byType(active(live)), fileCount: Object.keys(files).length },
+      persisted: { elementCount: persisted.length, activeElementCount: active(persisted).length, elementTypes: byType(active(persisted)), fileCount: Object.keys(view.excalidrawData?.files ?? {}).length },
+      persistence: { differenceCount: differences.length, differenceIds: differences.slice(0, 100), truncated: differences.length > 100 },
+      suspiciousElements: badElements,
+    };
+  })()`, targetId);
+}
 
 // Tool definitions
 const tools = [
@@ -181,6 +269,33 @@ const tools = [
         targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
       },
       required: ['id', 'file'],
+    },
+  },
+  {
+    name: 'obsidian_start_excalidraw_bug_window',
+    description: 'Begin a bounded Excalidraw debugging window. Reproduce the problem, then call obsidian_finish_excalidraw_bug_window to receive a correlated report of scene deltas, console output, and live-versus-persisted state.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        file: { type: 'string', description: 'Open Excalidraw file path to record' },
+        id: { type: 'string', description: 'Optional capture identifier; generated when omitted' },
+        maxEvents: { type: 'number', description: 'Maximum scene events to buffer (default 500)' },
+        targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
+      },
+      required: ['file'],
+    },
+  },
+  {
+    name: 'obsidian_finish_excalidraw_bug_window',
+    description: 'Finish an Excalidraw bug window and return its correlated report. The capture listener is removed by default.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        id: { type: 'string', description: 'Capture identifier returned by obsidian_start_excalidraw_bug_window' },
+        keepOpen: { type: 'boolean', description: 'Keep the listener installed for another reproduction (default false)' },
+        eventLimit: { type: 'number', description: 'Maximum scene events included in the report (default 200)' },
+      },
+      required: ['id'],
     },
   },
   {
@@ -610,6 +725,63 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           captureRaw: args?.captureRaw as boolean | undefined,
         });
         return { content: [{ type: 'text', text: toolText(result) }] };
+      }
+
+      case 'obsidian_start_excalidraw_bug_window': {
+        const file = args?.file as string;
+        const targetId = args?.targetId as string | undefined;
+        if (!file) throw new Error('file is required');
+        const id = (args?.id as string | undefined) ?? `bug-window:${Date.now()}`;
+        if (bugWindows.has(id)) throw new Error(`Bug window already exists: ${id}`);
+        const startedAt = Date.now();
+        const baseline = await getExcalidrawSceneSummary(file, targetId);
+        const consoleCounts = new Map(obsidian.getConsoleLogs({ level: 'all', limit: 300 })
+          .map(log => [consoleKey(log), log.repeatCount]));
+        await obsidian.installProbe(id, excalidrawWatcherInstaller(file), args?.maxEvents as number | undefined, targetId, {
+          captureRaw: false,
+          coalesce: true,
+        });
+        bugWindows.set(id, { id, file, startedAt, targetId, baseline, consoleCounts });
+        return { content: [{ type: 'text', text: toolText({
+          id, status: 'recording', file, startedAt, baseline,
+          next: 'Reproduce the problem, then call obsidian_finish_excalidraw_bug_window with this id.',
+        }) }] };
+      }
+
+      case 'obsidian_finish_excalidraw_bug_window': {
+        const id = args?.id as string;
+        if (!id) throw new Error('id is required');
+        const capture = bugWindows.get(id);
+        if (!capture) throw new Error(`No active bug window named: ${id}`);
+        const endedAt = Date.now();
+        const eventLimit = Math.max(1, Math.min(1000, Math.floor((args?.eventLimit as number | undefined) ?? 200)));
+        const probe = await obsidian.readProbe(id, { since: capture.startedAt, limit: eventLimit }, capture.targetId) as {
+          events?: Array<{ timestamp: number; lastTimestamp?: number; count?: number; data: unknown }>;
+        };
+        const sceneEvents = probe.events ?? [];
+        const allLogs = obsidian.getConsoleLogs({ since: capture.startedAt, level: 'all', limit: 300 });
+        const consoleEvents = allLogs.map(log => {
+          const baselineCount = capture.consoleCounts.get(consoleKey(log)) ?? 0;
+          return {
+            firstSeen: new Date(log.timestamp).toISOString(), lastSeen: new Date(log.lastTimestamp).toISOString(),
+            count: Math.max(0, log.repeatCount - baselineCount), level: log.level, message: log.message, stackTrace: log.stackTrace,
+          };
+        }).filter(log => log.count > 0 || Date.parse(log.lastSeen) >= capture.startedAt);
+        const final = await getExcalidrawSceneSummary(capture.file, capture.targetId);
+        const timeline = [
+          ...sceneEvents.map(event => ({ source: 'scene', timestamp: event.timestamp, lastTimestamp: event.lastTimestamp, count: event.count, event: event.data })),
+          ...consoleEvents.map(event => ({ source: 'console', timestamp: Math.max(Date.parse(event.firstSeen), capture.startedAt), lastTimestamp: Date.parse(event.lastSeen), count: event.count, level: event.level, message: event.message, stackTrace: event.stackTrace })),
+        ].sort((a, b) => a.timestamp - b.timestamp).slice(-eventLimit);
+        const keepOpen = args?.keepOpen === true;
+        if (!keepOpen) {
+          await obsidian.removeProbe(id, capture.targetId);
+          bugWindows.delete(id);
+        }
+        return { content: [{ type: 'text', text: toolText({
+          id, status: keepOpen ? 'recording' : 'finished', file: capture.file,
+          window: { startedAt: capture.startedAt, endedAt, durationMs: endedAt - capture.startedAt },
+          baseline: capture.baseline, final, sceneEvents, consoleEvents, timeline,
+        }) }] };
       }
 
       case 'obsidian_get_diagnostic_timeline': {

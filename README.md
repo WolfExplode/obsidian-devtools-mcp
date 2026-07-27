@@ -72,6 +72,8 @@ Reload the "doc-doctor" plugin and show any console errors.
 | `obsidian_install_probe` | Install a named disposable renderer listener/probe, with optional raw-payload preservation and coalescing |
 | `obsidian_read_probe` | Read/filter/clear buffered probe events, optionally including preserved raw payload JSON |
 | `obsidian_watch_excalidraw` | Watch an Excalidraw scene and report coalesced element, file, and app-state deltas |
+| `obsidian_start_excalidraw_bug_window` | Begin a bounded capture of an Excalidraw reproduction |
+| `obsidian_finish_excalidraw_bug_window` | Finish a capture and return scene, console, and persistence evidence in one report |
 | `obsidian_get_diagnostic_timeline` | Merge probe events, grouped console logs, and plugin diagnostic events by time |
 | `obsidian_remove_probe` | Dispose and remove a probe |
 | `obsidian_list_probes` | List installed probes and buffer sizes |
@@ -146,6 +148,26 @@ For a scene or method trace, the installer can wrap an object method and emit a
 stack or selected fields before calling the original method. Keep probes
 read-only when investigating live user workflows, and always remove them when
 the test is complete.
+
+### Excalidraw bug windows
+
+For a manual reproduction, use a bug window instead of assembling a watcher,
+console query, and state snapshots yourself. Starting a window records a compact
+baseline and installs a coalesced scene listener. Finishing it removes that
+listener by default and returns the baseline and final scene summaries, scene
+deltas, console output that occurred in the window, and a timestamp-sorted
+timeline. It does not clear the shared console buffer.
+
+```javascript
+obsidian_start_excalidraw_bug_window({ file: "WIP/diagram.md" })
+// Reproduce the problem in Obsidian.
+obsidian_finish_excalidraw_bug_window({ id: "bug-window:..." })
+```
+
+The scene summaries include live-versus-persisted element differences and flag
+zero-sized or file-backed elements whose live file entry is missing. Pass
+`keepOpen: true` when you want to capture another reproduction with the same
+window.
 
 ## Renderer vs. main process (important)
 
