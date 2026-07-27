@@ -85,21 +85,34 @@ export class ObsidianConnection {
       );
     }
 
-    this.client = await CDP({ port, target: mainTarget.id });
+    const client = await CDP({ port, target: mainTarget.id });
+    this.client = client;
     this.mainTargetId = mainTarget.id;
     this.connectedPort = port;
 
     // Enable necessary domains
-    await this.client.Runtime.enable();
-    await this.client.Page.enable();
+    await client.Runtime.enable();
+    await client.Page.enable();
 
     // Set up console log capture
-    this.registerConsoleCapture(this.client, mainTarget.id);
+    this.registerConsoleCapture(client, mainTarget.id);
 
     // Handle disconnection
-    this.client.on('disconnect', () => {
+    client.on('disconnect', () => {
+      // Do not let a late disconnect from an older connection tear down a
+      // newer session created by reconnecting.
+      if (this.client !== client) return;
       this.connected = false;
       this.client = null;
+      this.mainTargetId = null;
+      // Attached popout targets belong to the same CDP session. Their clients
+      // are no longer usable after the main target disconnects, so discard them
+      // rather than reusing dead sockets on a later obsidian_connect.
+      const targetClients = [...this.targetClients.values()];
+      this.targetClients.clear();
+      for (const targetClient of targetClients) {
+        void targetClient.close().catch(() => {});
+      }
     });
 
     this.connected = true;
@@ -481,6 +494,32 @@ export class ObsidianConnection {
           };
         };
         let sequence = 0;
+        // maxRawEventBytes is a storage limit, so enforce it on the final JSON
+        // string we retain, not only on the original payload. The old approach
+        // serialized a truncation envelope around a max-sized sample, which
+        // could expand past the advertised cap through JSON escaping.
+        const utf8Bytes = (text) => new TextEncoder().encode(text).length;
+        const boundRawJson = (raw) => {
+          const originalBytes = utf8Bytes(raw);
+          if (originalBytes <= maxRawEventBytes) return raw;
+          const envelope = (sample) => JSON.stringify({
+            truncated: true,
+            reason: 'max-raw-event-bytes',
+            originalBytes,
+            sample,
+          });
+          // Find the longest UTF-16 prefix whose *serialized envelope* fits
+          // within the UTF-8 byte budget. This also handles samples containing
+          // quotes, backslashes, emoji, and other multi-byte characters.
+          let low = 0;
+          let high = raw.length;
+          while (low < high) {
+            const middle = Math.ceil((low + high) / 2);
+            if (utf8Bytes(envelope(raw.slice(0, middle))) <= maxRawEventBytes) low = middle;
+            else high = middle - 1;
+          }
+          return envelope(raw.slice(0, low));
+        };
         const emit = (data, originalData = data) => {
           const timestamp = Date.now();
           const normalized = safe(data);
@@ -488,12 +527,9 @@ export class ObsidianConnection {
           let rawData;
           if (captureRaw) {
             try {
-              rawData = JSON.stringify(originalData);
-              if (rawData.length > maxRawEventBytes) {
-                rawData = JSON.stringify({ truncated: true, reason: 'max-raw-event-bytes', originalBytes: rawData.length, sample: rawData.slice(0, maxRawEventBytes) });
-              }
+              rawData = boundRawJson(JSON.stringify(originalData));
             } catch (_) {
-              rawData = JSON.stringify({ truncated: true, reason: 'raw-serialization-failed', type: typeof originalData });
+              rawData = boundRawJson(JSON.stringify({ truncated: true, reason: 'raw-serialization-failed', type: typeof originalData }));
             }
           }
           const previous = events.at(-1);
@@ -509,7 +545,11 @@ export class ObsidianConnection {
         if (typeof factory !== 'function') throw new Error('installer must evaluate to a function');
         const disposer = factory(emit);
         if (typeof disposer !== 'function') throw new Error('installer must return a disposer function');
-        root[id] = { createdAt: Date.now(), maxEvents, captureRaw, maxRawEventBytes, coalesce, events, dispose: disposer };
+        // A specialized installer can expose a synchronous flush function on
+        // its disposer. This is useful for debounced probes: reads then include
+        // the final pending event instead of reporting a stale snapshot.
+        const flush = typeof disposer.flush === 'function' ? disposer.flush.bind(disposer) : null;
+        root[id] = { createdAt: Date.now(), maxEvents, captureRaw, maxRawEventBytes, coalesce, events, flush, dispose: disposer };
         return { id, installed: true, maxEvents, captureRaw, coalesce };
       })()
     `, targetId);
@@ -521,6 +561,7 @@ export class ObsidianConnection {
       (() => {
         const probe = window.__obsidianDevtoolsProbes?.[${JSON.stringify(id)}];
         if (!probe) return { id: ${JSON.stringify(id)}, installed: false, events: [] };
+        try { probe.flush?.(); } catch (_) {}
         let events = probe.events.slice();
         ${options?.since != null ? `events = events.filter(e => e.timestamp >= ${Math.floor(options.since)});` : ''}
         ${limit != null ? `events = events.slice(-${limit});` : ''}

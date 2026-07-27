@@ -61,8 +61,41 @@ Reload the "doc-doctor" plugin and show any console errors.
 
 ## Available Tools
 
+### Tool discovery and profiles
+
+To avoid putting every specialised schema into the AI context for every turn,
+the server starts with the **core** toolset (14 routine plugin-development
+tools). Ask it to use `obsidian_discover_tools` when the task is unclear; it
+returns the appropriate toolset and the agent can call `obsidian_set_toolset`.
+Compatible MCP clients refresh their tool list automatically. If yours does
+not, reconnect after changing the toolset.
+
+| Toolset | Use for |
+|---|---|
+| `core` (default) | Connect/reload, console errors, renderer JS, commands, plugin and vault inspection |
+| `diagnostics` | Probes, Excalidraw reports, popouts, Electron windows, screenshots, and plugin diagnostics |
+| `full` | Every tool, including main-process JS, stores, and embedded plugin-MCP calls |
+
+Start with another default by setting `OBSIDIAN_MCP_TOOLSET` to `core`,
+`diagnostics`, or `full` in the MCP server environment. The toolset is scoped
+to that running server process.
+
+Example:
+
+```text
+Use obsidian_discover_tools for "debug an Excalidraw popout", then enable the recommended toolset.
+```
+
+The complete catalog, shown below, is available through these toolsets.
+
+For maintainers, profile membership and task matching live in
+[`src/tool-registry.ts`](src/tool-registry.ts); add or reclassify a tool there
+instead of duplicating its discovery rules in the request handler.
+
 | Tool | Description |
 |------|-------------|
+| `obsidian_discover_tools` | Recommend the right toolset for a development task |
+| `obsidian_set_toolset` | Switch the visible toolset and notify compatible clients |
 | `obsidian_connect` | Connect to Obsidian on specified port (default 9222) |
 | `obsidian_disconnect` | Disconnect from Obsidian |
 | `obsidian_list_targets` | List CDP renderer targets, including Popouts |
@@ -154,9 +187,10 @@ the test is complete.
 For a manual reproduction, use a bug window instead of assembling a watcher,
 console query, and state snapshots yourself. Starting a window records a compact
 baseline and installs a coalesced scene listener. Finishing it removes that
-listener by default and returns the baseline and final scene summaries, scene
-deltas, console output that occurred in the window, and a timestamp-sorted
-timeline. It does not clear the shared console buffer.
+listener by default and returns the baseline and final scene summaries plus one
+timestamp-sorted timeline of scene and console evidence. It does not clear the
+shared console buffer. Use `detail: "sources"` for separate scene and console
+arrays, or `detail: "summary"` for counts only.
 
 ```javascript
 obsidian_start_excalidraw_bug_window({ file: "WIP/diagram.md" })

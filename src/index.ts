@@ -7,6 +7,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { writeFile } from 'fs/promises';
 import { obsidian, type ConsoleEntry } from './connection.js';
+import { ToolRegistry, type Toolset } from './tool-registry.js';
 
 // MCP responses become model context. Keep ordinary diagnostic responses useful
 // but bounded; callers can still use execute_js to request a deliberately
@@ -49,7 +50,9 @@ function toolText(value: unknown): string {
 
 const server = new Server(
   { name: 'obsidian-devtools-mcp', version: '1.0.0' },
-  { capabilities: { tools: {} } }
+  // The tool list can be expanded on demand. Clients that support this
+  // notification refresh their schemas after obsidian_set_toolset is called.
+  { capabilities: { tools: { listChanged: true } } }
 );
 
 type BugWindow = {
@@ -123,6 +126,15 @@ function excalidrawWatcherInstaller(file: string, noise: 'compact' | 'all' = 'co
         zoom: appState?.zoom?.value || null,
       };
     };
+    // Excalidraw's onChange callback is not an initial-state subscription: its
+    // first invocation follows a mutation. Seed the comparison from the live
+    // API now so that first user action is reported as a real delta rather than
+    // being mislabeled and discarded as a baseline.
+    previous = snapshot(
+      api.getSceneElements?.() ?? [],
+      api.getAppState?.() ?? {},
+      api.getFiles?.() ?? {},
+    );
     const unsubscribe = api.onChange((elements, appState, files) => {
       const current = snapshot(elements, appState, files);
       const before = previous?.fingerprints || {};
@@ -154,7 +166,12 @@ function excalidrawWatcherInstaller(file: string, noise: 'compact' | 'all' = 'co
       }
       previous = current;
     });
-    return () => { flush(); unsubscribe?.(); };
+    const dispose = () => { flush(); unsubscribe?.(); };
+    // Let the probe host flush the debounce queue before it snapshots events.
+    // Without this, finishing a bug window immediately after an interaction can
+    // read the buffer before its final compacted action has been emitted.
+    dispose.flush = flush;
+    return dispose;
   }`;
 }
 
@@ -190,7 +207,30 @@ async function getExcalidrawSceneSummary(file: string, targetId?: string): Promi
 }
 
 // Tool definitions
-const tools = [
+const allTools = [
+  {
+    name: 'obsidian_discover_tools',
+    description: 'Find the right Obsidian development capability, then enable its toolset if needed.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        task: { type: 'string', description: 'Optional task, e.g. "debug Excalidraw" or "inspect a popout"' },
+      },
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
+  },
+  {
+    name: 'obsidian_set_toolset',
+    description: 'Switch visible tools: core for routine plugin work, diagnostics for probes and inspection, full for every tool.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        toolset: { type: 'string', enum: ['core', 'diagnostics', 'full'], description: 'Toolset to expose' },
+      },
+      required: ['toolset'],
+    },
+    annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
   {
     name: 'obsidian_connect',
     description:
@@ -337,13 +377,14 @@ const tools = [
   },
   {
     name: 'obsidian_finish_excalidraw_bug_window',
-    description: 'Finish an Excalidraw bug window and return its correlated report. The capture listener is removed by default.',
+    description: 'Finish an Excalidraw bug window and return its correlated report. Default timeline detail includes each event once; source arrays are opt-in. The capture listener is removed by default.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         id: { type: 'string', description: 'Capture identifier returned by obsidian_start_excalidraw_bug_window' },
         keepOpen: { type: 'boolean', description: 'Keep the listener installed for another reproduction (default false)' },
         eventLimit: { type: 'number', description: 'Maximum scene events included in the report (default 200)' },
+        detail: { type: 'string', enum: ['summary', 'timeline', 'sources'], description: 'Report evidence view: counts only, one merged timeline (default), or separate scene/console arrays' },
       },
       required: ['id'],
     },
@@ -585,9 +626,38 @@ const tools = [
   },
 ];
 
+// Tool definitions are part of the model's context on many MCP clients. Keep
+// the default focused on the normal edit/reload/debug loop; specialised tools
+// remain available after an explicit, discoverable switch.
+const CORE_TOOL_NAMES = [
+  'obsidian_discover_tools', 'obsidian_set_toolset',
+  'obsidian_connect', 'obsidian_disconnect', 'obsidian_reload_plugin',
+  'obsidian_get_console_logs', 'obsidian_clear_console_logs',
+  'obsidian_execute_js', 'obsidian_wait_for_condition',
+  'obsidian_get_plugin_info', 'obsidian_list_commands',
+  'obsidian_trigger_command', 'obsidian_get_vault_info',
+  'obsidian_get_plugin_settings',
+];
+const toolRegistry = new ToolRegistry(allTools, CORE_TOOL_NAMES);
+let activeToolset: Toolset = toolRegistry.normalize(process.env.OBSIDIAN_MCP_TOOLSET);
+
+function toolCatalog(task?: string) {
+  const discovery = toolRegistry.discover(task);
+  const recommended = discovery.recommendedToolset;
+  return {
+    activeToolset,
+    recommendedToolset: recommended,
+    matches: discovery.matches,
+    toolsets: toolRegistry.catalog(),
+    next: activeToolset === recommended
+      ? 'The recommended tools are visible now.'
+      : `Call obsidian_set_toolset with toolset: ${recommended}; compatible clients will refresh the tool list.`,
+  };
+}
+
 // Register tool list handler
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools,
+  tools: toolRegistry.list(activeToolset),
 }));
 
 // Register tool call handler
@@ -595,7 +665,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
+    if (!toolRegistry.has(activeToolset, name)) {
+      throw new Error(`Tool ${name} is not enabled. Call obsidian_discover_tools, then obsidian_set_toolset if needed.`);
+    }
     switch (name) {
+      case 'obsidian_discover_tools': {
+        return { content: [{ type: 'text', text: toolText(toolCatalog(args?.task as string | undefined)) }] };
+      }
+
+      case 'obsidian_set_toolset': {
+        const toolset = args?.toolset as Toolset | undefined;
+        if (toolset !== 'core' && toolset !== 'diagnostics' && toolset !== 'full') {
+          throw new Error('toolset must be core, diagnostics, or full');
+        }
+        activeToolset = toolset;
+        // The notification is advisory; older clients may require reconnecting
+        // before their cached tool list reflects the newly selected profile.
+        try { await server.sendToolListChanged(); } catch (_) {}
+        return { content: [{ type: 'text', text: toolText({
+          activeToolset,
+          visibleToolCount: toolRegistry.list(activeToolset).length,
+          next: 'Refresh tools if your client does not update them automatically.',
+        }) }] };
+      }
+
       case 'obsidian_connect': {
         const port = (args?.port as number) ?? 9222;
         const info = await obsidian.connect(port);
@@ -771,6 +864,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!capture) throw new Error(`No active bug window named: ${id}`);
         const endedAt = Date.now();
         const eventLimit = Math.max(1, Math.min(1000, Math.floor((args?.eventLimit as number | undefined) ?? 200)));
+        const detail = (args?.detail as 'summary' | 'timeline' | 'sources' | undefined) ?? 'timeline';
         const probe = await obsidian.readProbe(id, { since: capture.startedAt, limit: eventLimit }, capture.targetId) as {
           events?: Array<{ timestamp: number; lastTimestamp?: number; count?: number; data: unknown }>;
         };
@@ -799,11 +893,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           await obsidian.removeProbe(id, capture.targetId);
           bugWindows.delete(id);
         }
-        return { content: [{ type: 'text', text: toolText({
+        const report = {
           id, status: keepOpen ? 'recording' : 'finished', file: capture.file,
           window: { startedAt: capture.startedAt, endedAt, durationMs: endedAt - capture.startedAt },
-          baseline: capture.baseline, final, sceneEvents, consoleEvents, timeline,
-        }) }] };
+          baseline: capture.baseline, final,
+          evidence: {
+            view: detail,
+            sceneEventCount: sceneEvents.length,
+            sceneCallbackCount: sceneEvents.reduce((total, event) => total + (event.count ?? 1), 0),
+            consoleEventCount: consoleEvents.length,
+            consoleOccurrenceCount: consoleEvents.reduce((total, event) => total + event.count, 0),
+          },
+        };
+        const evidence = detail === 'timeline'
+          ? { timeline }
+          : detail === 'sources'
+            ? { sceneEvents, consoleEvents }
+            : {};
+        return { content: [{ type: 'text', text: toolText({ ...report, ...evidence }) }] };
       }
 
       case 'obsidian_get_diagnostic_timeline': {
