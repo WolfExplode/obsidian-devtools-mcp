@@ -241,7 +241,11 @@ async function getExcalidrawSceneSummary(file: string, targetId?: string): Promi
 const allTools = [
   {
     name: 'obsidian_discover_tools',
-    description: 'Recommend a toolset for an Obsidian task.',
+    description:
+      'Recommend a toolset for an Obsidian task. Call this before improvising a workaround: the default ' +
+      '"core" toolset only covers connect/reload/console/commands/vault/settings/renderer-JS. Probes, ' +
+      'screenshots, Excalidraw scene state, popout/window inspection, and main-process JS live in the ' +
+      '"diagnostics" and "full" toolsets and are invisible until obsidian_set_toolset reveals them.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -264,7 +268,10 @@ const allTools = [
   },
   {
     name: 'obsidian_connect',
-    description: 'Connect to Obsidian. Required before other tools.',
+    description:
+      'Connect to Obsidian. Required before other tools. Only a "core" toolset is visible by default — ' +
+      'if the task involves probes, screenshots, Excalidraw state, popouts, or main-process JS, call ' +
+      'obsidian_discover_tools first rather than approximating it with execute_js.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -726,6 +733,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 {
                   status: 'connected',
                   obsidian: info,
+                  hint:
+                    'Only the "core" toolset is visible right now. Before simulating input events, polling ' +
+                    'the DOM, or writing your own probe via execute_js: call obsidian_discover_tools with ' +
+                    'your task — probes, screenshots, Excalidraw scene state, popout/window inspection, and ' +
+                    'main-process JS are gated behind obsidian_set_toolset(diagnostics|full) and are easy to ' +
+                    'miss otherwise.',
                 }
               ),
             },
