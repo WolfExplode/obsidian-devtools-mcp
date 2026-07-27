@@ -27,11 +27,12 @@ const TOOLSETS: Record<Toolset, ToolsetDefinition> = {
     ],
   },
   full: {
-    useFor: 'main-process JavaScript plus plugin store and embedded-MCP inspection; it includes every tool',
-    keywords: ['main process', 'main-process', 'require.cache', 'store', 'svelte', 'embedded mcp', 'plugin mcp', 'bridge'],
+    useFor: 'main-process JavaScript plus plugin store, embedded-MCP inspection, and probes that auto-attach to future windows; it includes every tool',
+    keywords: ['main process', 'main-process', 'require.cache', 'store', 'svelte', 'embedded mcp', 'plugin mcp', 'bridge', 'new window', 'future window', 'auto-attach', 'auto attach'],
     additionalTools: [
       'obsidian_execute_js_main', 'obsidian_get_store_state',
-      'obsidian_call_plugin_mcp',
+      'obsidian_call_plugin_mcp', 'obsidian_install_window_probe',
+      'obsidian_remove_window_probe', 'obsidian_list_window_probes',
     ],
   },
 };

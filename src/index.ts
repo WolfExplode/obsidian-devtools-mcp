@@ -367,6 +367,41 @@ const allTools = [
     },
   },
   {
+    name: 'obsidian_install_window_probe',
+    description: 'Install a probe into every current AND future window matching a pattern (popouts included), so it survives windows opened after this call.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        id: { type: 'string', description: 'Probe identifier (letters, numbers, _, ., :, -). Every matched window gets its own independent buffer under this id.' },
+        installer: {
+          type: 'string',
+          description:
+            'JavaScript function expression, e.g. (emit) => { const ref = app.vault.on("modify", f => emit({path:f.path})); return () => app.vault.offref(ref); }',
+        },
+        urlPattern: { type: 'string', description: 'RegExp source tested against each window\'s webContents URL and title; omit to match every window (main + all popouts)' },
+        maxEvents: { type: 'number', description: 'Maximum buffered events per window (default 500, maximum 10000)' },
+        captureRaw: { type: 'boolean', description: 'Preserve original JSON payloads for later retrieval; disables event coalescing by default' },
+        maxRawEventBytes: { type: 'number', description: 'Maximum bytes per preserved raw payload (default 65536, maximum 1048576)' },
+        coalesce: { type: 'boolean', description: 'Coalesce consecutive equivalent summarized events (default true unless captureRaw is enabled)' },
+      },
+      required: ['id', 'installer'],
+    },
+  },
+  {
+    name: 'obsidian_remove_window_probe',
+    description: 'Stop future auto-injection for a window probe. Windows it already reached keep running their probe until removed there directly or the session disconnects.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: { id: { type: 'string', description: 'Probe identifier passed to obsidian_install_window_probe' } },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'obsidian_list_window_probes',
+    description: 'List active window-probe hooks (the main-process auto-injection registry, not per-window event buffers -- use obsidian_list_probes per target for those).',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
     name: 'obsidian_read_probe',
     description: 'Read buffered probe events.',
     inputSchema: {
@@ -849,6 +884,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           maxRawEventBytes: args?.maxRawEventBytes as number | undefined,
           coalesce: args?.coalesce as boolean | undefined,
         });
+        return { content: [{ type: 'text', text: toolText(result) }] };
+      }
+
+      case 'obsidian_install_window_probe': {
+        const id = args?.id as string;
+        const installer = args?.installer as string;
+        if (!id) throw new Error('id is required');
+        if (!installer) throw new Error('installer is required');
+        const result = await obsidian.installWindowProbe(
+          id,
+          installer,
+          args?.urlPattern as string | undefined,
+          args?.maxEvents as number | undefined,
+          {
+            captureRaw: args?.captureRaw as boolean | undefined,
+            maxRawEventBytes: args?.maxRawEventBytes as number | undefined,
+            coalesce: args?.coalesce as boolean | undefined,
+          },
+        );
+        return { content: [{ type: 'text', text: toolText(result) }] };
+      }
+
+      case 'obsidian_remove_window_probe': {
+        const id = args?.id as string;
+        if (!id) throw new Error('id is required');
+        const result = await obsidian.removeWindowProbe(id);
+        return { content: [{ type: 'text', text: toolText(result) }] };
+      }
+
+      case 'obsidian_list_window_probes': {
+        const result = await obsidian.listWindowProbes();
         return { content: [{ type: 'text', text: toolText(result) }] };
       }
 

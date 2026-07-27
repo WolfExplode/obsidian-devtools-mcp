@@ -228,6 +228,24 @@ export class ObsidianConnection {
           // renderers and close all CDP connections below.
         }
       }
+      // Window-probe hooks live in Obsidian's main process (a
+      // browser-window-created listener), which keeps running across MCP
+      // server restarts unlike the renderer probes above. Leaving one
+      // registered would silently keep auto-injecting into every new window
+      // opened by a completely unrelated future session.
+      try {
+        await this.evaluateMain(`(() => {
+          const { app } = require('electron');
+          const registry = global.__obsidianDevtoolsWindowHooks || {};
+          for (const id of Object.keys(registry)) {
+            try { app.removeListener('browser-window-created', registry[id].handler); } catch (e) {}
+            delete registry[id];
+          }
+          return null;
+        })()`);
+      } catch (_) {
+        // Best-effort: main process may already be gone (Obsidian closing).
+      }
       for (const target of this.targetClients.values()) {
         try { await target.close(); } catch (_) {}
       }
@@ -413,14 +431,21 @@ export class ObsidianConnection {
     this.consoleLogs = [];
   }
 
-  /** Install a named, disposable event probe in the renderer realm. */
-  async installProbe(
+  /**
+   * Renderer-side script that defines window.__obsidianDevtoolsProbes[id] and
+   * runs `installer` against it. Shared by installProbe (single target, called
+   * directly) and installWindowProbe (same script, but handed to
+   * `webContents.executeJavaScript` from main for every matching window,
+   * present and future) so both paths produce probes with identical read/
+   * remove/list semantics — obsidian_read_probe works the same either way,
+   * just against a different target per window.
+   */
+  private buildProbeInstallScript(
     id: string,
     installer: string,
-    maxEvents = 500,
-    targetId?: string,
+    maxEvents: number,
     options?: { captureRaw?: boolean; maxRawEventBytes?: number; coalesce?: boolean },
-  ): Promise<unknown> {
+  ): string {
     if (!/^[A-Za-z0-9_.:-]+$/.test(id)) throw new Error('Probe id contains invalid characters');
     if (!installer.trim()) throw new Error('installer is required');
     const boundedMax = Number.isFinite(maxEvents)
@@ -431,7 +456,7 @@ export class ObsidianConnection {
       ? Math.max(1024, Math.min(1024 * 1024, Math.floor(options!.maxRawEventBytes!)))
       : 64 * 1024;
     const coalesce = options?.coalesce ?? !captureRaw;
-    return this.evaluateInTarget(`
+    return `
       (() => {
         const id = ${JSON.stringify(id)};
         const maxEvents = ${boundedMax};
@@ -557,7 +582,103 @@ export class ObsidianConnection {
         root[id] = { createdAt: Date.now(), maxEvents, captureRaw, maxRawEventBytes, coalesce, events, flush, dispose: disposer };
         return { id, installed: true, maxEvents, captureRaw, coalesce };
       })()
-    `, targetId);
+    `;
+  }
+
+  /** Install a named, disposable event probe in one renderer realm. */
+  async installProbe(
+    id: string,
+    installer: string,
+    maxEvents = 500,
+    targetId?: string,
+    options?: { captureRaw?: boolean; maxRawEventBytes?: number; coalesce?: boolean },
+  ): Promise<unknown> {
+    const script = this.buildProbeInstallScript(id, installer, maxEvents, options);
+    return this.evaluateInTarget(script, targetId);
+  }
+
+  /**
+   * Install the same probe into every current AND future window whose
+   * webContents URL or title matches `urlPattern` (a RegExp source; omit to
+   * match every window). Persists as an Electron main-process
+   * `browser-window-created` listener, so a popout/prototype/child window
+   * opened minutes later during the same Obsidian session still gets
+   * instrumented automatically -- no manual re-injection per window like
+   * obsidian_install_probe requires.
+   *
+   * Each matched window ends up with its own independent
+   * window.__obsidianDevtoolsProbes[id] (same shape installProbe produces),
+   * so obsidian_read_probe / obsidian_remove_probe / obsidian_list_probes
+   * work unchanged against any of those targets once you have its targetId
+   * (obsidian_list_targets). Removing the hook (obsidian_remove_window_probe)
+   * stops future auto-injection but does not retroactively strip the probe
+   * from windows it already reached.
+   */
+  async installWindowProbe(
+    id: string,
+    installer: string,
+    urlPattern?: string,
+    maxEvents = 500,
+    options?: { captureRaw?: boolean; maxRawEventBytes?: number; coalesce?: boolean },
+  ): Promise<unknown> {
+    const rendererScript = this.buildProbeInstallScript(id, installer, maxEvents, options);
+    const mainCode = `(() => {
+      const { app, BrowserWindow } = require('electron');
+      const registry = global.__obsidianDevtoolsWindowHooks || (global.__obsidianDevtoolsWindowHooks = Object.create(null));
+      const id = ${JSON.stringify(id)};
+      const urlPattern = ${urlPattern ? JSON.stringify(urlPattern) : 'null'};
+      const script = ${JSON.stringify(rendererScript)};
+
+      const previous = registry[id];
+      if (previous) { try { app.removeListener('browser-window-created', previous.handler); } catch (e) {} }
+
+      const matches = (win) => {
+        if (!urlPattern) return true;
+        try {
+          const re = new RegExp(urlPattern);
+          return re.test(win.webContents.getURL()) || re.test(win.getTitle());
+        } catch (e) { return true; }
+      };
+
+      const inject = (win) => {
+        try {
+          const wc = win.webContents;
+          const run = () => { if (matches(win)) wc.executeJavaScript(script).catch(() => {}); };
+          if (wc.isLoading()) wc.once('did-finish-load', run); else run();
+        } catch (e) {}
+      };
+
+      const handler = (event, win) => inject(win);
+      app.on('browser-window-created', handler);
+
+      const existing = BrowserWindow.getAllWindows();
+      let matchedExisting = 0;
+      for (const win of existing) { if (matches(win)) { inject(win); matchedExisting++; } }
+
+      registry[id] = { handler, urlPattern, createdAt: Date.now() };
+      return { id, installed: true, urlPattern, matchedExistingWindows: matchedExisting, totalWindows: existing.length };
+    })()`;
+    return this.evaluateMain(mainCode);
+  }
+
+  /** Stop future auto-injection for a window probe installed via installWindowProbe. Already-injected windows keep their probe until removeProbe/disconnect. */
+  async removeWindowProbe(id: string): Promise<unknown> {
+    return this.evaluateMain(`(() => {
+      const { app } = require('electron');
+      const registry = global.__obsidianDevtoolsWindowHooks || {};
+      const entry = registry[${JSON.stringify(id)}];
+      if (!entry) return { id: ${JSON.stringify(id)}, removed: false };
+      try { app.removeListener('browser-window-created', entry.handler); } finally { delete registry[${JSON.stringify(id)}]; }
+      return { id: ${JSON.stringify(id)}, removed: true };
+    })()`);
+  }
+
+  /** List active window-probe hooks (main-process registry, not per-window buffers -- use listProbes(targetId) for those). */
+  async listWindowProbes(): Promise<unknown> {
+    return this.evaluateMain(`(() => {
+      const registry = global.__obsidianDevtoolsWindowHooks || {};
+      return Object.entries(registry).map(([id, entry]) => ({ id, urlPattern: entry.urlPattern, createdAt: entry.createdAt }));
+    })()`);
   }
 
   async readProbe(id: string, options?: { since?: number; limit?: number; clear?: boolean; includeRaw?: boolean }, targetId?: string): Promise<unknown> {
