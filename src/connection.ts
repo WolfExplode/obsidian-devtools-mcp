@@ -317,6 +317,11 @@ export class ObsidianConnection {
     if (!this.client) {
       throw new Error('Not connected to Obsidian. Use obsidian_connect first.');
     }
+    // The wrapper below interpolates code as `(${code})`, so a trailing
+    // semicolon (a near-universal habit, especially after an IIFE) turns a
+    // valid expression into `(expr;)` -- a syntax error. Stripping one
+    // trailing `;` is always safe: expressions never legitimately end in one.
+    code = code.trim().replace(/;+\s*$/, '');
     // Runs in MAIN. process.mainModule.require gives main's require (with .cache).
     const mainWrapper = `
       (function () {
