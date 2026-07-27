@@ -66,7 +66,7 @@ type BugWindow = {
 const bugWindows = new Map<string, BugWindow>();
 
 function consoleKey(log: ConsoleEntry): string {
-  return JSON.stringify([log.level, log.message, log.stackTrace]);
+  return JSON.stringify([log.targetId, log.level, log.message, log.stackTrace]);
 }
 
 function excalidrawWatcherInstaller(file: string, noise: 'compact' | 'all' = 'compact'): string {
@@ -688,6 +688,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   firstSeen: new Date(l.timestamp).toISOString(),
                   lastSeen: new Date(l.lastTimestamp).toISOString(),
                   count: l.repeatCount,
+                  targetId: l.targetId,
                   level: l.level,
                   message: l.message,
                   stackTrace: l.stackTrace,
@@ -744,7 +745,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'obsidian_start_excalidraw_bug_window': {
         const file = args?.file as string;
-        const targetId = args?.targetId as string | undefined;
+        const targetId = obsidian.resolveTargetId(args?.targetId as string | undefined);
         if (!file) throw new Error('file is required');
         const id = (args?.id as string | undefined) ?? `bug-window:${Date.now()}`;
         if (bugWindows.has(id)) throw new Error(`Bug window already exists: ${id}`);
@@ -774,12 +775,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           events?: Array<{ timestamp: number; lastTimestamp?: number; count?: number; data: unknown }>;
         };
         const sceneEvents = probe.events ?? [];
-        const allLogs = obsidian.getConsoleLogs({ since: capture.startedAt, level: 'all', limit: 300 });
+        const allLogs = obsidian.getConsoleLogs({
+          since: capture.startedAt,
+          level: 'all',
+          limit: 300,
+          targetId: capture.targetId,
+        });
         const consoleEvents = allLogs.map(log => {
           const baselineCount = capture.consoleCounts.get(consoleKey(log)) ?? 0;
           return {
             firstSeen: new Date(log.timestamp).toISOString(), lastSeen: new Date(log.lastTimestamp).toISOString(),
-            count: Math.max(0, log.repeatCount - baselineCount), level: log.level, message: log.message, stackTrace: log.stackTrace,
+            count: Math.max(0, log.repeatCount - baselineCount), targetId: log.targetId,
+            level: log.level, message: log.message, stackTrace: log.stackTrace,
           };
         }).filter(log => log.count > 0 || Date.parse(log.lastSeen) >= capture.startedAt);
         const final = await getExcalidrawSceneSummary(capture.file, capture.targetId);
@@ -813,7 +820,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         })()`, targetId) : [];
         const timeline = [
           ...(probe?.events || []).map(event => ({ source: 'probe', timestamp: event.timestamp, lastTimestamp: event.lastTimestamp, count: event.count, event: event.data })),
-          ...obsidian.getConsoleLogs({ since, limit: 300 }).map(log => ({ source: 'console', timestamp: log.timestamp, lastTimestamp: log.lastTimestamp, count: log.repeatCount, level: log.level, message: log.message, stackTrace: log.stackTrace })),
+          ...obsidian.getConsoleLogs({ since, limit: 300, targetId }).map(log => ({ source: 'console', timestamp: log.timestamp, lastTimestamp: log.lastTimestamp, count: log.repeatCount, targetId: log.targetId, level: log.level, message: log.message, stackTrace: log.stackTrace })),
           ...pluginEvents.filter(event => typeof event.timestamp === 'number' && (since == null || event.timestamp >= since)).map(event => ({ source: 'plugin', timestamp: event.timestamp as number, event })),
         ].sort((a, b) => a.timestamp - b.timestamp).slice(-limit);
         return { content: [{ type: 'text', text: toolText({ timeline, sources: { probeId, pluginId } }) }] };

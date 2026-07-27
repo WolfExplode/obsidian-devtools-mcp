@@ -15,6 +15,7 @@ export interface ConsoleEntry {
   timestamp: number;
   lastTimestamp: number;
   repeatCount: number;
+  targetId?: string;
   level: string;
   message: string;
   args: unknown[];
@@ -54,6 +55,12 @@ export class ObsidianConnection {
     return this.connected && this.client !== null;
   }
 
+  resolveTargetId(targetId?: string): string {
+    const resolved = targetId ?? this.mainTargetId;
+    if (!resolved) throw new Error('Not connected to Obsidian. Use obsidian_connect first.');
+    return resolved;
+  }
+
   async connect(port: number = 9222): Promise<ObsidianInfo> {
     if (this.client) {
       await this.disconnect();
@@ -87,7 +94,32 @@ export class ObsidianConnection {
     await this.client.Page.enable();
 
     // Set up console log capture
-    this.client.Runtime.consoleAPICalled((params) => {
+    this.registerConsoleCapture(this.client, mainTarget.id);
+
+    // Handle disconnection
+    this.client.on('disconnect', () => {
+      this.connected = false;
+      this.client = null;
+    });
+
+    this.connected = true;
+
+    // Get Obsidian info
+    const info = await this.evaluate<ObsidianInfo>(`
+      (function() {
+        return {
+          version: app.version || 'unknown',
+          vaultName: app.vault.getName(),
+          vaultPath: app.vault.adapter.basePath
+        };
+      })()
+    `);
+
+    return info;
+  }
+
+  private registerConsoleCapture(client: CDP.Client, targetId: string): void {
+    client.Runtime.consoleAPICalled((params) => {
       const args = params.args.map((arg) => {
         if (arg.type === 'string') return arg.value;
         if (arg.type === 'number') return arg.value;
@@ -118,6 +150,7 @@ export class ObsidianConnection {
         timestamp,
         lastTimestamp: timestamp,
         repeatCount: 1,
+        targetId,
         level: params.type,
         message: message.length > this.MAX_LOG_MESSAGE_CHARS
           ? message.slice(0, this.MAX_LOG_MESSAGE_CHARS) + '…'
@@ -130,6 +163,7 @@ export class ObsidianConnection {
       // Group by message and stack signature even when other logs interleave.
       // This makes render-loop failures readable without losing frequency/timing.
       const matching = this.consoleLogs.find((existing) =>
+        existing.targetId === entry.targetId &&
         existing.level === entry.level &&
         existing.message === entry.message &&
         JSON.stringify(existing.stackTrace) === JSON.stringify(entry.stackTrace)
@@ -146,36 +180,16 @@ export class ObsidianConnection {
         this.consoleLogs.shift();
       }
     });
-
-    // Handle disconnection
-    this.client.on('disconnect', () => {
-      this.connected = false;
-      this.client = null;
-    });
-
-    this.connected = true;
-
-    // Get Obsidian info
-    const info = await this.evaluate<ObsidianInfo>(`
-      (function() {
-        return {
-          version: app.version || 'unknown',
-          vaultName: app.vault.getName(),
-          vaultPath: app.vault.adapter.basePath
-        };
-      })()
-    `);
-
-    return info;
   }
 
   async disconnect(): Promise<void> {
     if (this.client) {
       // Probes are runtime instrumentation, not durable application state.
       // Dispose them when the MCP session ends so a later session cannot inherit
-      // stale listeners from an earlier investigation.
-      try {
-        await this.evaluate(`
+      // stale listeners from an earlier investigation. Each popout is a
+      // separate renderer realm, so clean the main renderer and every attached
+      // target rather than only the main window.
+      const disposeProbes = `
           (() => {
             const root = window.__obsidianDevtoolsProbes;
             if (!root) return 0;
@@ -187,17 +201,24 @@ export class ObsidianConnection {
             }
             return removed;
           })()
-        `);
-      } catch (_) {
-        // The renderer may already be gone; closing the CDP connection remains
-        // the important cleanup path.
-      }
-      for (const [id, target] of this.targetClients) {
-        if (target !== this.client) {
-          try { await target.close(); } catch (_) {}
+        `;
+      const targets = [this.client, ...this.targetClients.values()];
+      for (const target of targets) {
+        try {
+          await target.Runtime.evaluate({
+            expression: disposeProbes,
+            returnByValue: true,
+            awaitPromise: true,
+          });
+        } catch (_) {
+          // A popout may already have closed; continue cleaning the remaining
+          // renderers and close all CDP connections below.
         }
-        this.targetClients.delete(id);
       }
+      for (const target of this.targetClients.values()) {
+        try { await target.close(); } catch (_) {}
+      }
+      this.targetClients.clear();
       await this.client.close();
       this.client = null;
       this.mainTargetId = null;
@@ -248,6 +269,7 @@ export class ObsidianConnection {
       target = await CDP({ port: this.connectedPort, target: targetId });
       await target.Runtime.enable();
       await target.Page.enable();
+      this.registerConsoleCapture(target, targetId);
       this.targetClients.set(targetId, target);
     }
     return target;
@@ -328,6 +350,7 @@ export class ObsidianConnection {
     level?: 'log' | 'warn' | 'error' | 'info' | 'debug' | 'all';
     limit?: number;
     since?: number;
+    targetId?: string;
     clear?: boolean;
   }): ConsoleEntry[] {
     let logs = [...this.consoleLogs];
@@ -343,6 +366,10 @@ export class ObsidianConnection {
     // Filter by level
     if (options?.level && options.level !== 'all') {
       logs = logs.filter((log) => log.level === options.level);
+    }
+
+    if (options?.targetId) {
+      logs = logs.filter((log) => log.targetId === options.targetId);
     }
 
     // Limit results
@@ -530,7 +557,15 @@ export class ObsidianConnection {
     const started = Date.now();
     let last: unknown;
     while (Date.now() - started < timeoutMs) {
-      last = await this.evaluateInTarget(`(${predicate})`, targetId);
+      // Accept either a direct condition expression or a predicate function.
+      // Returning the value lets CDP's awaitPromise option also support async
+      // predicates without a separate polling path.
+      last = await this.evaluateInTarget(`
+        (() => {
+          const candidate = (${predicate});
+          return typeof candidate === 'function' ? candidate() : candidate;
+        })()
+      `, targetId);
       if (last) return last as T;
       await new Promise((resolve) => setTimeout(resolve, Math.max(10, intervalMs)));
     }
