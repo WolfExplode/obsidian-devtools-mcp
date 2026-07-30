@@ -8,8 +8,12 @@ MCP (Model Context Protocol) server for Obsidian that enables AI-assisted plugin
 - **Multi-window inspection** - Inspect and evaluate Popout and transparent-window renderer targets
 - **Console log capture** - Read console logs/errors/warnings
 - **Persistent runtime probes** - Install named, disposable listeners with bounded event buffers
+- **Per-frame sampling** - Sample an expression every animation frame, to observe rendering while a *user* performs a gesture
+- **Canvas measurement** - Size, opaque-pixel count, coverage and content hash for every canvas matching a selector
+- **Render-state awareness** - Readings are flagged when the renderer isn't painting, and frames can be forced on demand
 - **Condition waiting** - Wait for real renderer readiness predicates with timeout diagnostics
 - **Excalidraw diagnostics** - Compare live scene state with the persisted scene and embedded file map
+- **Excalidraw snapshot/restore** - Capture a scene verbatim before a destructive experiment, and restore it exactly
 - **Electron window inspection** - Inspect native BrowserWindow bounds, focus, and always-on-top state
 - **Execute JavaScript** - Run arbitrary JS in Obsidian's renderer, or in the Electron main process (`obsidian_execute_js_main`)
 - **Plugin inspection** - Query plugin state, settings, and manifests
@@ -151,12 +155,40 @@ instead of duplicating its discovery rules in the request handler.
                                        └─────────────────────┘
 ```
 
+| Module | Responsibility |
+| --- | --- |
+| `src/index.ts` | MCP protocol wiring: tool schemas and handlers |
+| `src/connection.ts` | CDP transport, evaluation, console capture, probes, screenshots |
+| `src/renderer-scripts.ts` | JavaScript shipped *into* the page (canvas helpers, per-frame sampler) |
+| `src/scene-snapshot.ts` | Excalidraw scene capture/restore, disk-backed |
+| `src/tool-registry.ts` | Toolset taxonomy and discovery |
+
+`renderer-scripts.ts` and `scene-snapshot.ts` are separate modules so `verify/live.mjs`
+can exercise them without booting the server on stdio.
+
 ## Development Workflow
 
 1. Start Obsidian with `./dev-obsidian.sh`
 2. Start Claude Code
 3. Ask Claude to connect to Obsidian
 4. Develop your plugin - Claude can reload it after each build
+
+### Verifying the server
+
+This server is almost entirely I/O against a live Electron app, so unit tests
+would mostly assert that string templates are unchanged. `npm run verify` instead
+builds and then exercises the real CDP path against a running Obsidian, asserting
+on real renderer behaviour — including that a hidden window's rAF really is
+paused and that `pumpFrames` really restarts it.
+
+```bash
+npm run verify                    # read-only checks
+npm run verify -- --destructive   # also mutates and restores an open Excalidraw board
+```
+
+The destructive group is opt-in because it damages an open board on purpose (it
+moves elements, deletes one, and rewrites z-order) to prove the snapshot/restore
+round trip actually recovers it.
 
 Example workflow:
 ```
@@ -191,6 +223,80 @@ For a scene or method trace, the installer can wrap an object method and emit a
 stack or selected fields before calling the original method. Keep probes
 read-only when investigating live user workflows, and always remove them when
 the test is complete.
+
+### A hidden window is not painting (read this before measuring pixels)
+
+**When Obsidian is not the foreground window, `document.visibilityState` is
+`"hidden"` and the renderer stops firing `requestAnimationFrame` entirely.**
+Since an agent driving Obsidian over CDP is essentially never the focused window,
+this is the normal case, not an edge case. Two consequences, both silent:
+
+- Any feature built on a rAF loop is **frozen**, so `getImageData` through
+  `obsidian_execute_js` returns whatever was painted last — a stale bitmap with no
+  indication that it is stale.
+- `obsidian_capture_screenshot` **forces a frame**, so a screenshot of that same
+  instant looks completely correct. The two tools disagree.
+
+This combination once cost an afternoon: an overlay read an identical pixel count
+in every state and a debug hook reported "loop running, nothing painted", all of
+which pointed at a plugin bug that did not exist.
+
+The server now handles it three ways:
+
+- `obsidian_connect` reports `render` up front, with a warning when hidden.
+- `obsidian_execute_js` and `obsidian_canvas_probe` attach a warning to any
+  reading taken while the renderer is paused.
+- Both accept `pumpFrames: n`, which forces `n` frames — running the paused rAF
+  callbacks — before reading, so pixel assertions against a background window are
+  valid rather than quietly wrong.
+
+```javascript
+obsidian_canvas_probe({ selector: ".excalidraw canvas", pumpFrames: 2 })
+// → per-canvas bitmap size, opaquePixels, coveragePercent, hash
+```
+
+### Watching rendering during a real gesture
+
+Scripted input is the wrong tool for "does this render correctly *while* the user
+drags something" — a synthetic drag can appear to work while exercising a
+different code path (pointer-event coalescing alone will mislead you). Use the
+same listener discipline as event probes, at frame resolution: install the
+sampler, ask the user to perform the gesture, then read the buffer.
+
+```javascript
+obsidian_watch_frames({
+  id: "overlay-during-drag",
+  expression: `({ overlay: $canvas(".my-overlay")[0]?.hash, zoom: $render().visibility })`
+})
+// ...user drags an element...
+obsidian_read_probe({ id: "overlay-during-drag" })
+obsidian_remove_probe({ id: "overlay-during-drag" })
+```
+
+Helpers in scope: `$canvas(selector)`, `$pixel(selector, x, y)`, `$render()`.
+Consecutive identical samples coalesce, which is what makes "did this change
+during the gesture" readable at a glance. Nothing is sampled while the window is
+hidden — correctly, since that is also when the feature under test isn't
+rendering.
+
+### Snapshot a scene before breaking it
+
+Excalidraw derives z-order from a fractional `index` property, not from array
+position. So reordering the elements array and writing it back appears to do
+nothing, while writing back objects whose `index` was already rewritten silently
+reorders the board — and both failure modes look identical from outside. Take a
+snapshot before any destructive experiment on a real vault:
+
+```javascript
+obsidian_excalidraw_snapshot({})            // → { token, elementCount, bytes }
+// ...mutate freely...
+obsidian_excalidraw_restore({ token })      // → { orderMatches: true, ... }
+```
+
+Elements are stored verbatim, `index` included, so a restore is exact rather than
+approximate. The payload is written to disk, so it survives an MCP or renderer
+restart, and `restore` reports whether ids actually came back in the captured
+order instead of assuming the write worked.
 
 ### Excalidraw bug windows
 

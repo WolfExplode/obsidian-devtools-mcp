@@ -6,7 +6,9 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { writeFile } from 'fs/promises';
-import { obsidian, type ConsoleEntry } from './connection.js';
+import { obsidian, type ConsoleEntry, type RenderState } from './connection.js';
+import { CANVAS_HELPERS_JS, frameWatcherInstaller } from './renderer-scripts.js';
+import { captureSceneSnapshot, restoreSceneSnapshot } from './scene-snapshot.js';
 import { ToolRegistry, type Toolset } from './tool-registry.js';
 
 // MCP responses become model context. Keep ordinary diagnostic responses useful
@@ -206,6 +208,7 @@ function excalidrawWatcherInstaller(file: string, noise: 'compact' | 'all' = 'co
   }`;
 }
 
+
 async function getExcalidrawSceneSummary(file: string, targetId?: string): Promise<unknown> {
   return obsidian.evaluateInTarget(`(() => {
     const path = ${JSON.stringify(file)};
@@ -236,6 +239,24 @@ async function getExcalidrawSceneSummary(file: string, targetId?: string): Promi
     };
   })()`, targetId);
 }
+
+/**
+ * The warning attached to any result that may have been read from a renderer
+ * that isn't painting. Returns null when the window is visible, so a healthy
+ * session sees no extra noise — the point is to speak up only in the case that
+ * silently produces wrong readings.
+ */
+function renderWarning(render: RenderState | undefined): string | null {
+  if (!render?.rafPaused) return null;
+  return (
+    `Obsidian is ${render.visibility} (focused: ${render.hasFocus}), so the renderer is NOT firing ` +
+    'requestAnimationFrame. Anything driven by a rAF loop is frozen, and canvas pixels read here may ' +
+    'be a stale bitmap — while obsidian_capture_screenshot forces a frame and would look correct at ' +
+    'this same instant. Pass pumpFrames (e.g. 2) to force frames before reading, or have the user ' +
+    'focus the Obsidian window.'
+  );
+}
+
 
 // Tool definitions
 const allTools = [
@@ -418,6 +439,88 @@ const allTools = [
     },
   },
   {
+    name: 'obsidian_watch_frames',
+    description:
+      'Sample an expression once per animation frame into a probe buffer. The frame-accurate ' +
+      'counterpart to event probes, and the right way to verify rendering DURING a gesture: install ' +
+      'this, ask the user to perform the drag/draw themselves, then obsidian_read_probe. Prefer this ' +
+      'over dispatching synthetic pointer events, which can appear to work while testing something ' +
+      'else. Helpers in scope: $canvas(selector) (bitmap size, opaque-pixel count, sampled hash for ' +
+      'every match), $pixel(selector, x, y) (RGBA at CSS coordinates), $render() (visibility/rAF ' +
+      'state). Samples nothing while the window is hidden, because rAF is paused then.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        id: { type: 'string', description: 'Probe identifier (letters, numbers, _, ., :, -)' },
+        expression: {
+          type: 'string',
+          description:
+            'Expression evaluated each sampled frame, e.g. $canvas(".epr-front-of-embed-overlay") or ' +
+            '({ overlay: $canvas("canvas.overlay")[0]?.hash, zoom: app.workspace.activeLeaf.view.excalidrawAPI.getAppState().zoom.value })',
+        },
+        sampleEvery: { type: 'number', description: 'Sample every Nth frame (default 1)' },
+        maxFrames: { type: 'number', description: 'Stop after this many samples (default 0 = until removed)' },
+        maxEvents: { type: 'number', description: 'Maximum buffered samples (default 500, maximum 10000)' },
+        targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
+      },
+      required: ['id', 'expression'],
+    },
+  },
+  {
+    name: 'obsidian_canvas_probe',
+    description:
+      'Measure canvases without hand-writing getImageData: returns bitmap/CSS size, opaque-pixel ' +
+      'count, coverage percent and a sampled content hash for EVERY element matching the selector, so ' +
+      'two canvases can be compared in one call. Use pumpFrames to force frames first when the window ' +
+      'is backgrounded, otherwise the pixels read may be stale.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        selector: { type: 'string', description: 'CSS selector; all matches are measured (e.g. ".excalidraw canvas")' },
+        at: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Optional [x, y] in CSS pixels; returns the RGBA value at that point of the first match',
+        },
+        pumpFrames: { type: 'number', description: 'Force this many frames before reading (default 0; try 2 when hidden)' },
+        targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
+      },
+      required: ['selector'],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'obsidian_excalidraw_snapshot',
+    description:
+      'Capture a restorable copy of an open Excalidraw scene before mutating it. Take one before any ' +
+      'destructive experiment on a real vault: elements are stored verbatim, including the fractional ' +
+      '`index` values Excalidraw derives z-order from, so a restore is exact. Written to disk, so it ' +
+      'survives an MCP or renderer restart.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        file: { type: 'string', description: 'Excalidraw file path; optional when exactly one view is open' },
+        targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
+      },
+    },
+  },
+  {
+    name: 'obsidian_excalidraw_restore',
+    description:
+      'Restore a scene captured by obsidian_excalidraw_snapshot, then verify it: the result reports ' +
+      'whether element ids came back in the captured ORDER, because writing an array back does not by ' +
+      'itself determine z-order (Excalidraw sorts by fractional index).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        token: { type: 'string', description: 'Token returned by obsidian_excalidraw_snapshot' },
+        restoreViewport: { type: 'boolean', description: 'Also restore scroll/zoom (default false)' },
+        targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
+      },
+      required: ['token'],
+    },
+  },
+  {
     name: 'obsidian_watch_excalidraw',
     description: 'Watch an Excalidraw scene; compact mode is default.',
     inputSchema: {
@@ -491,13 +594,24 @@ const allTools = [
   },
   {
     name: 'obsidian_execute_js',
-    description: 'Run JavaScript in the Obsidian renderer.',
+    description:
+      'Run JavaScript in the Obsidian renderer. Each call gets its own async function scope, so ' +
+      'declarations never collide between calls and `await` works at top level. Pass either an ' +
+      'expression (its value is returned) or statements that `return` a value. Results are flagged ' +
+      'when the renderer is not painting — see pumpFrames.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         code: {
           type: 'string',
-          description: 'JavaScript code to execute',
+          description: 'An expression, or statements that return a value. May use await.',
+        },
+        pumpFrames: {
+          type: 'number',
+          description:
+            'Force this many frames before evaluating (default 0, maximum 60). Needed for pixel or ' +
+            'rAF-dependent reads while Obsidian is backgrounded, since a hidden renderer stops firing ' +
+            'requestAnimationFrame and canvas reads then return a stale bitmap. Try 2.',
         },
         targetId: { type: 'string', description: 'CDP target ID; omit for the main Obsidian renderer' },
       },
@@ -712,13 +826,17 @@ let activeToolset: Toolset = toolRegistry.normalize(process.env.OBSIDIAN_MCP_TOO
 function toolCatalog(task?: string) {
   const discovery = toolRegistry.discover(task);
   const recommended = discovery.recommendedToolset;
+  // Toolsets are cumulative, so only recommend switching when it would actually
+  // reveal something. Saying "set diagnostics" to a session already on full read
+  // as advice to give up tools it had.
+  const alreadyCovered = toolRegistry.covers(activeToolset, recommended);
   return {
     activeToolset,
     recommendedToolset: recommended,
     matches: discovery.matches,
     toolsets: toolRegistry.catalog(),
-    next: activeToolset === recommended
-      ? 'The recommended tools are visible now.'
+    next: alreadyCovered
+      ? `The recommended tools are already visible under the active "${activeToolset}" toolset; no switch needed.`
       : `Call obsidian_set_toolset with toolset: ${recommended}; compatible clients will refresh the tool list.`,
   };
 }
@@ -760,6 +878,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'obsidian_connect': {
         const port = (args?.port as number) ?? 9222;
         const info = await obsidian.connect(port);
+        // Reported at connect because it silently invalidates pixel-level and
+        // rAF-dependent readings for the whole session, and an agent driving
+        // Obsidian over CDP is essentially never the focused window.
+        const render = await obsidian.getRenderState();
         return {
           content: [
             {
@@ -768,12 +890,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 {
                   status: 'connected',
                   obsidian: info,
+                  render,
+                  ...(render.rafPaused
+                    ? {
+                        renderStateWarning:
+                          `Obsidian is ${render.visibility}: the renderer is NOT firing requestAnimationFrame, ` +
+                          'so rAF-driven rendering is frozen and canvas pixel reads will be stale (while ' +
+                          'screenshots force a frame and look correct). Pass pumpFrames to execute_js / ' +
+                          'canvas_probe, or ask the user to focus the window.',
+                      }
+                    : {}),
                   hint:
-                    'Only the "core" toolset is visible right now. Before simulating input events, polling ' +
-                    'the DOM, or writing your own probe via execute_js: call obsidian_discover_tools with ' +
-                    'your task — probes, screenshots, Excalidraw scene state, popout/window inspection, and ' +
-                    'main-process JS are gated behind obsidian_set_toolset(diagnostics|full) and are easy to ' +
-                    'miss otherwise.',
+                    'Only the "core" toolset is visible right now. Before polling the DOM in a loop or ' +
+                    'writing your own probe via execute_js: call obsidian_discover_tools with your task — ' +
+                    'probes, per-frame sampling, canvas measurement, scene snapshot/restore, screenshots, ' +
+                    'Excalidraw state, popouts, and main-process JS are gated behind ' +
+                    'obsidian_set_toolset(diagnostics|full) and are easy to miss otherwise.',
                 }
               ),
             },
@@ -1057,16 +1189,96 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new Error('code is required');
         }
 
-        const result = await obsidian.evaluateInTarget(code, args?.targetId as string | undefined);
+        const { value, render } = await obsidian.evaluateUserCode(code, {
+          targetId: args?.targetId as string | undefined,
+          pumpFrames: args?.pumpFrames as number | undefined,
+        });
+        const warning = renderWarning(render);
         return {
           content: [
-            {
-              type: 'text',
-              text:
-                toolText(result),
-            },
+            { type: 'text', text: toolText(value) },
+            // A separate block rather than wrapping the value, so the result shape
+            // callers already parse is unchanged and the warning is still unmissable.
+            ...(warning ? [{ type: 'text', text: toolText({ renderStateWarning: warning, render }) }] : []),
           ],
         };
+      }
+
+      case 'obsidian_watch_frames': {
+        const id = args?.id as string;
+        const expression = args?.expression as string;
+        if (!id || !expression) throw new Error('id and expression are required');
+        const targetId = args?.targetId as string | undefined;
+        const installer = frameWatcherInstaller(
+          expression,
+          (args?.sampleEvery as number | undefined) ?? 1,
+          (args?.maxFrames as number | undefined) ?? 0,
+        );
+        const result = await obsidian.installProbe(
+          id,
+          installer,
+          args?.maxEvents as number | undefined,
+          targetId,
+          { coalesce: true },
+        );
+        const render = await obsidian.getRenderState(targetId);
+        return {
+          content: [{ type: 'text', text: toolText({
+            ...(result as object),
+            render,
+            next: render.rafPaused
+              ? 'Obsidian is hidden, so no frames will be sampled until it is focused. Ask the user to ' +
+                'focus the window and perform the interaction, then call obsidian_read_probe.'
+              : 'Ask the user to perform the interaction, then call obsidian_read_probe with this id.',
+          }) }],
+        };
+      }
+
+      case 'obsidian_canvas_probe': {
+        const selector = args?.selector as string;
+        if (!selector) throw new Error('selector is required');
+        const targetId = args?.targetId as string | undefined;
+        const at = args?.at as [number, number] | undefined;
+        const pumped = await obsidian.pumpFrames((args?.pumpFrames as number | undefined) ?? 0, targetId);
+        const result = await obsidian.evaluateInTarget(`(() => {
+          ${CANVAS_HELPERS_JS}
+          return {
+            render: $render(),
+            canvases: $canvas(${JSON.stringify(selector)}),
+            ${at ? `pixel: $pixel(${JSON.stringify(selector)}, ${Number(at[0])}, ${Number(at[1])}),` : ''}
+          };
+        })()`, targetId);
+        const render = (result as { render?: RenderState }).render;
+        const warning = pumped ? null : renderWarning(render);
+        return {
+          content: [
+            { type: 'text', text: toolText({ ...(result as object), framesPumped: pumped }) },
+            ...(warning ? [{ type: 'text', text: toolText({ renderStateWarning: warning }) }] : []),
+          ],
+        };
+      }
+
+      case 'obsidian_excalidraw_snapshot': {
+        const snapshot = await captureSceneSnapshot(
+          args?.file as string | undefined,
+          args?.targetId as string | undefined,
+        );
+        return {
+          content: [{ type: 'text', text: toolText({
+            ...snapshot,
+            next: `Mutate freely, then obsidian_excalidraw_restore with token "${snapshot.token}".`,
+          }) }],
+        };
+      }
+
+      case 'obsidian_excalidraw_restore': {
+        const token = args?.token as string;
+        if (!token) throw new Error('token is required');
+        const result = await restoreSceneSnapshot(token, {
+          targetId: args?.targetId as string | undefined,
+          restoreViewport: args?.restoreViewport as boolean | undefined,
+        });
+        return { content: [{ type: 'text', text: toolText(result) }] };
       }
 
       case 'obsidian_execute_js_main': {

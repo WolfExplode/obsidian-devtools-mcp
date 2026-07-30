@@ -37,6 +37,52 @@ export interface ProbeEvent {
   rawData?: string;
 }
 
+/** Whether the renderer is painting. See ObsidianConnection.getRenderState. */
+export interface RenderState {
+  visibility: 'visible' | 'hidden' | 'prerender';
+  hasFocus: boolean;
+  /** True whenever hidden: the renderer stops firing requestAnimationFrame entirely. */
+  rafPaused: boolean;
+}
+
+/** `new AsyncFunction(...)` — the parser used to classify caller-supplied code below. */
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
+  ...args: string[]
+) => unknown;
+
+/**
+ * Turn caller-supplied code into the body of an async function.
+ *
+ * An expression becomes `return (expr);` so its value is what the caller gets;
+ * anything else is used verbatim as statements and has to `return` for itself.
+ * Classification is a real V8 parse rather than a regex, done locally so a
+ * malformed snippet reports its syntax error without a round trip.
+ */
+function toFunctionBody(code: string): string {
+  // `return ( expr; )` is a syntax error, and a trailing semicolon after an
+  // expression (or an IIFE) is a near-universal habit. Dropping it is always
+  // safe: an expression never legitimately ends in one.
+  const expression = code.trim().replace(/;+\s*$/, '');
+  const asExpression = `return (\n${expression}\n);`;
+  try {
+    new AsyncFunction(asExpression);
+    return asExpression;
+  } catch {
+    // Not an expression. Validate the statement form here so the error names the
+    // real problem instead of surfacing as a confusing wrapper-level SyntaxError.
+    try {
+      new AsyncFunction(code);
+    } catch (error) {
+      throw new Error(
+        `Could not parse code as an expression or as statements: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+    return code;
+  }
+}
+
 export class ObsidianConnection {
   private client: CDP.Client | null = null;
   private mainTargetId: string | null = null;
@@ -314,6 +360,94 @@ export class ObsidianConnection {
       throw new Error(error.exception?.description || error.text || 'Unknown evaluation error');
     }
     return result.result.value as T;
+  }
+
+  /**
+   * Whether the renderer is currently painting.
+   *
+   * This matters far more than it looks. A backgrounded Obsidian window reports
+   * `visibilityState: "hidden"` and the renderer then stops firing
+   * `requestAnimationFrame` callbacks altogether — so any feature built on a rAF
+   * loop is frozen, and reading canvas pixels through execute_js returns a stale
+   * bitmap with no indication that it is stale. Because an agent driving Obsidian
+   * over CDP is by definition not looking at the window, this is the *normal*
+   * case, not an edge case. Screenshots, meanwhile, force a frame and therefore
+   * look correct at the same instant — so the two tools disagree and neither
+   * warns you. Surfacing this is cheap; discovering it costs an afternoon.
+   */
+  async getRenderState(targetId?: string): Promise<RenderState> {
+    return this.evaluateInTarget<RenderState>(`
+      (() => ({
+        visibility: document.visibilityState,
+        hasFocus: document.hasFocus(),
+        // Spec-level consequence of being hidden; no need to wait a frame to know it.
+        rafPaused: document.visibilityState === 'hidden',
+      }))()
+    `, targetId);
+  }
+
+  /**
+   * Force the compositor to produce `count` frames, which also runs any pending
+   * `requestAnimationFrame` callbacks, even while the window is hidden.
+   *
+   * `Page.captureScreenshot` is the lever: it drives a frame regardless of
+   * visibility, which is exactly why screenshots of a backgrounded window show
+   * correct rAF-driven rendering while `getImageData` from execute_js shows a
+   * stale one. Capturing a 1x1 clip makes that side effect cheap enough to use
+   * deliberately, so pixel-level assertions can be made against a hidden window
+   * instead of being silently wrong.
+   */
+  async pumpFrames(count: number, targetId?: string): Promise<number> {
+    const frames = Math.max(0, Math.min(60, Math.floor(count)));
+    if (frames === 0) return 0;
+    const client = await this.getClient(targetId);
+    for (let i = 0; i < frames; i++) {
+      await client.Page.captureScreenshot({
+        format: 'jpeg',
+        quality: 1,
+        clip: { x: 0, y: 0, width: 1, height: 1, scale: 1 },
+      });
+    }
+    return frames;
+  }
+
+  /**
+   * Evaluate caller-supplied JavaScript, unlike `evaluateInTarget`'s
+   * server-generated expressions. Two things differ, both learned the hard way:
+   *
+   * - The code runs inside its own async function scope, so consecutive calls
+   *   cannot collide. Evaluating at top level meant a second call declaring the
+   *   same `const` failed with "Identifier 'out' has already been declared",
+   *   making every snippet need a hand-written IIFE.
+   * - Statement bodies work, not just expressions. Whether the code is an
+   *   expression is decided here with a local V8 parse (no round trip, and no
+   *   confusing a runtime `SyntaxError` for a compile-time one); statement
+   *   bodies must `return` a value themselves.
+   *
+   * Returns the render state alongside the value so the caller can flag results
+   * that were read from a frozen renderer. See `getRenderState`.
+   */
+  async evaluateUserCode<T>(
+    code: string,
+    options?: { targetId?: string; pumpFrames?: number },
+  ): Promise<{ value: T; render: RenderState }> {
+    if (options?.pumpFrames) await this.pumpFrames(options.pumpFrames, options.targetId);
+
+    const body = toFunctionBody(code);
+    const expression = `
+      (async () => {
+        const __value = await (async () => { ${body} })();
+        return {
+          value: __value === undefined ? null : __value,
+          render: {
+            visibility: document.visibilityState,
+            hasFocus: document.hasFocus(),
+            rafPaused: document.visibilityState === 'hidden',
+          },
+        };
+      })()
+    `;
+    return this.evaluateInTarget<{ value: T; render: RenderState }>(expression, options?.targetId);
   }
 
   /**

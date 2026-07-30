@@ -15,8 +15,14 @@ const TOOLSETS: Record<Toolset, ToolsetDefinition> = {
     additionalTools: [],
   },
   diagnostics: {
-    useFor: 'event probes, Excalidraw reproduction reports, popouts, Electron windows, screenshots, workspace leaves, and plugin diagnostics',
-    keywords: ['excalidraw', 'probe', 'event', 'timeline', 'popout', 'window', 'screenshot', 'leaf', 'workspace', 'diagnostic'],
+    useFor:
+      'event probes, per-frame sampling, canvas/pixel measurement, Excalidraw scene snapshot and restore, ' +
+      'reproduction reports, popouts, Electron windows, screenshots, workspace leaves, and plugin diagnostics',
+    keywords: [
+      'excalidraw', 'probe', 'event', 'timeline', 'popout', 'window', 'screenshot', 'leaf', 'workspace',
+      'diagnostic', 'canvas', 'pixel', 'render', 'rendering', 'frame', 'animation', 'repaint', 'overlay',
+      'visual', 'drag', 'gesture', 'snapshot', 'restore', 'undo', 'z-order', 'zorder',
+    ],
     additionalTools: [
       'obsidian_list_targets', 'obsidian_install_probe', 'obsidian_read_probe',
       'obsidian_watch_excalidraw', 'obsidian_start_excalidraw_bug_window',
@@ -24,6 +30,8 @@ const TOOLSETS: Record<Toolset, ToolsetDefinition> = {
       'obsidian_remove_probe', 'obsidian_list_probes', 'obsidian_get_native_windows',
       'obsidian_get_excalidraw_state', 'obsidian_list_leaves',
       'obsidian_get_plugin_diagnostics', 'obsidian_capture_screenshot',
+      'obsidian_watch_frames', 'obsidian_canvas_probe',
+      'obsidian_excalidraw_snapshot', 'obsidian_excalidraw_restore',
     ],
   },
   full: {
@@ -80,6 +88,18 @@ export class ToolRegistry<T extends RegisteredTool> {
 
   has(toolset: Toolset, name: string): boolean {
     return this.namesByToolset.get(toolset)?.has(name) ?? false;
+  }
+
+  /**
+   * Whether `active` already exposes everything `candidate` would.
+   *
+   * Toolsets are cumulative, so a recommendation is only actionable when it adds
+   * tools. Without this check, asking for a "debug Excalidraw" recommendation
+   * while already on `full` advised switching *to* `diagnostics` — which would
+   * have taken tools away.
+   */
+  covers(active: Toolset, candidate: Toolset): boolean {
+    return TOOLSET_ORDER.indexOf(active) >= TOOLSET_ORDER.indexOf(candidate);
   }
 
   discover(task?: string): {
