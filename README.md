@@ -2,6 +2,8 @@
 
 MCP (Model Context Protocol) server for Obsidian that enables AI-assisted plugin development via Chrome DevTools Protocol.
 
+Want a plugin you can toggle inside Obsidian instead? See [MCP Port](obsidian-mcp-port/README.md). It opens a localhost MCP endpoint immediately when enabled and offers basic note tools. On a later fresh launch, it also restarts Obsidian with the debugging port that this DevTools server needs.
+
 ## Features
 
 - **Hot reload plugins** - Reload plugins without manual toggling
@@ -31,24 +33,9 @@ npm install
 npm run build
 ```
 
-### 2. Launch Obsidian with debugging
+### 2. Enable debugging in Obsidian
 
-```bash
-./dev-obsidian.sh
-```
-
-Or manually:
-
-```bash
-# macOS
-/Applications/Obsidian.app/Contents/MacOS/Obsidian --remote-debugging-port=9222
-
-# Linux
-obsidian --remote-debugging-port=9222
-
-# Windows
-%LOCALAPPDATA%\Obsidian\Obsidian.exe --remote-debugging-port=9222
-```
+Install and enable the [MCP Port plugin](obsidian-mcp-port/README.md). On the next fresh launch, it restarts Obsidian once with the DevTools port on `9222`. The plugin's own note endpoint opens immediately at `http://127.0.0.1:27124/mcp`.
 
 ### 3. Register with Claude Code
 
@@ -168,7 +155,7 @@ can exercise them without booting the server on stdio.
 
 ## Development Workflow
 
-1. Start Obsidian with `./dev-obsidian.sh`
+1. Start Obsidian with the MCP Port plugin enabled and wait for its one-time debugging restart
 2. Start Claude Code
 3. Ask Claude to connect to Obsidian
 4. Develop your plugin - Claude can reload it after each build
