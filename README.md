@@ -35,7 +35,7 @@ npm run build
 
 ### 2. Enable debugging in Obsidian
 
-Install and enable the [MCP Port plugin](obsidian-mcp-port/README.md). On the next fresh launch, it restarts Obsidian once with the DevTools port on `9222`. The plugin's own note endpoint opens immediately at `http://127.0.0.1:27124/mcp`.
+Install and enable the [MCP Port plugin](obsidian-mcp-port/README.md). On the next fresh launch, it restarts Obsidian once with the DevTools port on `9223`. The plugin's own note endpoint opens immediately at `http://127.0.0.1:27124/mcp`.
 
 ### 3. Register with Claude Code
 
@@ -97,7 +97,7 @@ instead of duplicating its discovery rules in the request handler.
 |------|-------------|
 | `obsidian_discover_tools` | Recommend the right toolset for a development task |
 | `obsidian_set_toolset` | Switch the visible toolset and notify compatible clients |
-| `obsidian_connect` | Connect to Obsidian on specified port (default 9222) |
+| `obsidian_connect` | Connect to Obsidian on specified port (default 9223) |
 | `obsidian_disconnect` | Disconnect from Obsidian |
 | `obsidian_list_targets` | List CDP renderer targets, including Popouts |
 | `obsidian_reload_plugin` | Reload a plugin by ID |
@@ -138,7 +138,7 @@ instead of duplicating its discovery rules in the request handler.
                                                   ▼
                                        ┌─────────────────────┐
                                        │ Obsidian            │
-                                       │ (port 9222)         │
+                                       │ (port 9223)         │
                                        └─────────────────────┘
 ```
 

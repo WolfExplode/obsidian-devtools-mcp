@@ -1,4 +1,4 @@
-export const DEBUG_PORT = 9222;
+export const DEBUG_PORT = 9223;
 
 export interface MainLaunchState {
   pid: number;

@@ -86,7 +86,7 @@ function toFunctionBody(code: string): string {
 export class ObsidianConnection {
   private client: CDP.Client | null = null;
   private mainTargetId: string | null = null;
-  private connectedPort = 9222;
+  private connectedPort = 9223;
   private targetClients = new Map<string, CDP.Client>();
   private consoleLogs: ConsoleEntry[] = [];
   private connected = false;
@@ -107,7 +107,7 @@ export class ObsidianConnection {
     return resolved;
   }
 
-  async connect(port: number = 9222): Promise<ObsidianInfo> {
+  async connect(port: number = 9223): Promise<ObsidianInfo> {
     if (this.client) {
       await this.disconnect();
     }
@@ -324,7 +324,7 @@ export class ObsidianConnection {
     return result.result.value as T;
   }
 
-  async listTargets(port = 9222): Promise<unknown[]> {
+  async listTargets(port = 9223): Promise<unknown[]> {
     return (await CDP.List({ port })).map((target) => ({
       id: target.id,
       type: target.type,

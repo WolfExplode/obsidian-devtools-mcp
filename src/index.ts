@@ -298,8 +298,8 @@ const allTools = [
       properties: {
         port: {
           type: 'number',
-          description: 'CDP port (default: 9222)',
-          default: 9222,
+          description: 'CDP port (default: 9223)',
+          default: 9223,
         },
       },
     },
@@ -315,7 +315,7 @@ const allTools = [
   {
     name: 'obsidian_list_targets',
     description: 'List Obsidian renderer targets.',
-    inputSchema: { type: 'object' as const, properties: { port: { type: 'number', default: 9222 } } },
+    inputSchema: { type: 'object' as const, properties: { port: { type: 'number', default: 9223 } } },
   },
   {
     name: 'obsidian_reload_plugin',
@@ -876,7 +876,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'obsidian_connect': {
-        const port = (args?.port as number) ?? 9222;
+        const port = (args?.port as number) ?? 9223;
         const info = await obsidian.connect(port);
         // Reported at connect because it silently invalidates pixel-level and
         // rAF-dependent readings for the whole session, and an agent driving
@@ -921,7 +921,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'obsidian_list_targets': {
-        const result = await obsidian.listTargets((args?.port as number) ?? 9222);
+        const result = await obsidian.listTargets((args?.port as number) ?? 9223);
         return { content: [{ type: 'text', text: toolText(result) }] };
       }
 

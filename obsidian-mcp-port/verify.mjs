@@ -111,7 +111,7 @@ Plugin.saved = { port, lastMainPid: 1000 };
 const laterLaunch = new InstalledPlugin();
 await laterLaunch.onload();
 assert.equal(relaunches, 1, 'a later fresh launch should arrange one debug restart');
-assert.deepEqual(relaunchArgs, ['--remote-debugging-port=9222']);
+assert.deepEqual(relaunchArgs, ['--remote-debugging-port=9223']);
 assert.equal(quits, 1);
 await laterLaunch.onunload();
 Module._load = originalLoad;
