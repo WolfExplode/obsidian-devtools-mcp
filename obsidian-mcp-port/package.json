@@ -1,0 +1,20 @@
+{
+  "name": "obsidian-mcp-port",
+  "version": "0.2.0",
+  "private": true,
+  "scripts": {
+    "build": "node esbuild.mjs && tsc --noEmit",
+    "dev": "node esbuild.mjs --watch",
+    "verify": "npm run build && node verify.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.24.3",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "esbuild": "^0.28.2",
+    "obsidian": "^1.13.1",
+    "typescript": "^5.3.0"
+  }
+}
