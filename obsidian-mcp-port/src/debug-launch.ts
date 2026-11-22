@@ -1,4 +1,4 @@
-export const DEBUG_PORT = 9222;
+export const DEBUG_PORT = 9223;
 
 export interface MainLaunchState {
   pid: number;
@@ -28,7 +28,8 @@ export function shouldRelaunch(lastMainPid: number | undefined, state: MainLaunc
   return lastMainPid !== undefined && lastMainPid !== state.pid && !hasDebugPort(state.args);
 }
 
-export function scheduleDebugRelaunch(): boolean {
+export function scheduleDebugRelaunch(port = DEBUG_PORT): boolean {
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Choose a DevTools port from 1024 to 65535.');
   // The guard lives in the main process so multiple vault windows cannot queue
   // multiple app.relaunch calls (which would launch multiple Obsidian instances).
   const code = `(() => {
@@ -39,7 +40,7 @@ export function scheduleDebugRelaunch(): boolean {
     const app = requireMain('electron').app;
     const args = process.argv.slice(1).filter(arg =>
       arg !== '--remote-debugging-port' && !arg.startsWith('--remote-debugging-port='));
-    args.push('--remote-debugging-port=${DEBUG_PORT}');
+    args.push('--remote-debugging-port=${port}');
     globalThis[key] = true;
     setTimeout(() => {
       app.relaunch({ args });

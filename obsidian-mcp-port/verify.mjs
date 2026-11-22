@@ -11,8 +11,18 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 class TFile { constructor(path) { this.path = path; } }
+class MarkdownView {}
+let activeView = Object.assign(new MarkdownView(), {
+  file: new TFile('First.md'),
+  getMode: () => 'source',
+  editor: {
+    listSelections: () => [{ anchor: { line: 0, ch: 10 }, head: { line: 0, ch: 2 } }],
+    getRange: (from, to) => { assert.equal(from.ch, 2); assert.equal(to.ch, 10); return 'starting'; },
+  },
+});
 const files = new Map([['First.md', 'A starting note.']]);
 const vault = {
+  adapter: { getFullPath: path => `C:/Vault/${path}` },
   getMarkdownFiles: () => [...files.keys()].map((path) => new TFile(path)),
   getAbstractFileByPath: (path) => files.has(path) ? new TFile(path) : null,
   read: async (file) => files.get(file.path),
@@ -20,6 +30,7 @@ const vault = {
   process: async (file, fn) => { files.set(file.path, fn(files.get(file.path))); },
   create: async (path, content) => { files.set(path, content); },
 };
+const app = { vault, workspace: { getActiveViewOfType: () => activeView, getMostRecentLeaf: () => null } };
 const result = await esbuild.build({
   entryPoints: ['src/mcp-port.ts'], bundle: true, platform: 'node', format: 'cjs',
   packages: 'external', write: false,
@@ -29,7 +40,7 @@ mockModule.filename = `${here}/verify-bundle.cjs`;
 mockModule.paths = Module._nodeModulePaths(here);
 const originalLoad = Module._load;
 Module._load = function (request, parent, isMain) {
-  if (request === 'obsidian') return { TFile, normalizePath: (path) => path };
+  if (request === 'obsidian') return { TFile, MarkdownView, normalizePath: (path) => path };
   return originalLoad.call(this, request, parent, isMain);
 };
 try { mockModule._compile(result.outputFiles[0].text, mockModule.filename); }
@@ -37,12 +48,24 @@ finally { Module._load = originalLoad; }
 
 const { startMcpPort } = mockModule.exports;
 const port = 31000 + Math.floor(Math.random() * 10000);
-const running = await startMcpPort(vault, port);
+const running = await startMcpPort(app, port);
 const client = new Client({ name: 'verify-client', version: '1.0.0' });
 try {
   await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`)));
   const tools = await client.listTools();
-  assert.deepEqual(tools.tools.map(({ name }) => name), ['list_notes', 'read_note', 'search_notes', 'write_note']);
+  assert.deepEqual(tools.tools.map(({ name }) => name), ['get_selection', 'list_notes', 'read_note', 'search_notes', 'write_note']);
+  const selection = async () => JSON.parse((await client.callTool({ name: 'get_selection', arguments: {} })).content[0].text);
+  assert.deepEqual(await selection(), { path: 'First.md', absolutePath: 'C:/Vault/First.md', text: 'starting' });
+  activeView.editor.listSelections = () => [];
+  assert.equal((await selection()).text, '');
+  activeView.getMode = () => 'preview';
+  const node = {};
+  activeView.containerEl = { ownerDocument: { defaultView: { getSelection: () => ({ anchorNode: node, focusNode: node, toString: () => 'Reading highlight' }) } }, contains: n => n === node };
+  assert.equal((await selection()).text, 'Reading highlight');
+  activeView.containerEl.contains = () => false;
+  assert.equal((await selection()).text, '', 'ignore selection outside the active note');
+  activeView = null;
+  assert.deepEqual(await selection(), { path: null, text: '' });
   const read = await client.callTool({ name: 'read_note', arguments: { path: 'First.md' } });
   assert.equal(read.content[0].text, 'A starting note.');
   await client.callTool({ name: 'write_note', arguments: { path: 'New.md', content: 'Hello from MCP.' } });
@@ -58,7 +81,7 @@ await assert.rejects(fetch(`http://127.0.0.1:${port}/mcp`));
 // Load the installable bundle from a path with no node_modules ancestry.
 class Plugin {
   static saved = { port };
-  app = { vault };
+  app = app;
   async loadData() { return Plugin.saved; }
   async saveData(data) { Plugin.saved = data; }
   addSettingTab() {}
@@ -88,7 +111,7 @@ const installedModule = new Module(join(tmpdir(), 'obsidian-mcp-port-verify', 'm
 installedModule.filename = join(tmpdir(), 'obsidian-mcp-port-verify', 'main.js');
 installedModule.paths = Module._nodeModulePaths(join(tmpdir(), 'obsidian-mcp-port-verify'));
 Module._load = function (request, parent, isMain) {
-  if (request === 'obsidian') return { Plugin, PluginSettingTab, Setting, Notice, TFile, normalizePath: (path) => path };
+  if (request === 'obsidian') return { Plugin, PluginSettingTab, Setting, Notice, TFile, MarkdownView, normalizePath: (path) => path };
   if (request === '@electron/remote') return remote;
   return originalLoad.call(this, request, parent, isMain);
 };
@@ -111,8 +134,22 @@ Plugin.saved = { port, lastMainPid: 1000 };
 const laterLaunch = new InstalledPlugin();
 await laterLaunch.onload();
 assert.equal(relaunches, 1, 'a later fresh launch should arrange one debug restart');
-assert.deepEqual(relaunchArgs, ['--remote-debugging-port=9222']);
+assert.deepEqual(relaunchArgs, ['--remote-debugging-port=9223']);
 assert.equal(quits, 1);
 await laterLaunch.onunload();
+Plugin.saved = { port, debugPort: 9224, lastMainPid: 1000 };
+const alternateLaunch = new InstalledPlugin();
+await alternateLaunch.onload();
+assert.equal(relaunches, 2);
+assert.deepEqual(relaunchArgs, ['--remote-debugging-port=9224']);
+assert.equal(Plugin.saved.debugPort, 9224);
+await alternateLaunch.setDebugPort(port);
+assert.equal(alternateLaunch.getDebugPort(), 9224, 'debug port cannot equal the note endpoint');
+await alternateLaunch.setDebugPort(65536);
+assert.equal(alternateLaunch.getDebugPort(), 9224);
+await alternateLaunch.setDebugPort(9225);
+assert.equal(Plugin.saved.debugPort, 9225);
+assert.equal(relaunches, 2, 'changing settings must not restart the current session');
+await alternateLaunch.onunload();
 Module._load = originalLoad;
 console.log('MCP endpoint verified: connect, list, read, write, search, close, standalone bundle, debug relaunch scheduling.');

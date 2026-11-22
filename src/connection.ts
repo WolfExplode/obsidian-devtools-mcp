@@ -1,4 +1,5 @@
 import CDP from 'chrome-remote-interface';
+import { discoverTargets } from './discovery.js';
 
 interface StackTrace {
   description?: string;
@@ -50,6 +51,14 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as
   ...args: string[]
 ) => unknown;
 
+export function findMainTarget(targets: Awaited<ReturnType<typeof discoverTargets>>) {
+  return targets.find((t) => t.type === 'page' && t.url.startsWith('app://obsidian.md/')) ?? targets.find(
+    (t) => t.type === 'page' && !t.url.startsWith('devtools://') &&
+      !t.url.startsWith('chrome-extension://') &&
+      (t.title.includes('Obsidian') || t.url.startsWith('app://'))
+  );
+}
+
 /**
  * Turn caller-supplied code into the body of an async function.
  *
@@ -86,7 +95,7 @@ function toFunctionBody(code: string): string {
 export class ObsidianConnection {
   private client: CDP.Client | null = null;
   private mainTargetId: string | null = null;
-  private connectedPort = 9222;
+  private connectedPort = 9223;
   private targetClients = new Map<string, CDP.Client>();
   private consoleLogs: ConsoleEntry[] = [];
   private connected = false;
@@ -107,31 +116,32 @@ export class ObsidianConnection {
     return resolved;
   }
 
-  async connect(port: number = 9222): Promise<ObsidianInfo> {
+  async connect(port: number = 9223): Promise<ObsidianInfo> {
     if (this.client) {
       await this.disconnect();
     }
 
     // List available targets
-    const targets = await CDP.List({ port });
+    const targets = await discoverTargets(port);
 
     // Find the main Obsidian window (not devtools, not extensions)
-    const mainTarget = targets.find(
-      (t) =>
-        t.type === 'page' &&
-        !t.url.startsWith('devtools://') &&
-        !t.url.startsWith('chrome-extension://') &&
-        (t.title.includes('Obsidian') || t.url.startsWith('app://'))
-    );
+    const mainTarget = findMainTarget(targets);
 
     if (!mainTarget) {
       throw new Error(
-        'Could not find Obsidian main window. Available targets: ' +
-          targets.map((t) => `${t.type}: ${t.title || t.url}`).join(', ')
+        `DevTools on port ${port} responded, but no Obsidian main window was found. ` +
+          'This may be another browser or Electron app; check the port. Available targets: ' +
+          (targets.slice(0, 8).map((t) => `${t.type}: ${(t.title || t.url).slice(0, 160)}`).join(', ') || '(none)')
       );
     }
 
-    const client = await CDP({ port, target: mainTarget.id });
+    let client: CDP.Client;
+    try {
+      client = await CDP({ host: '127.0.0.1', port, target: mainTarget.id });
+    } catch (error) {
+      const detail = (error instanceof Error ? error.message : String(error)).trim();
+      throw new Error(`Could not attach to Obsidian DevTools on port ${port}: ${detail || 'empty handshake error; check that this port belongs to Obsidian'}`);
+    }
     this.client = client;
     this.mainTargetId = mainTarget.id;
     this.connectedPort = port;
@@ -324,8 +334,8 @@ export class ObsidianConnection {
     return result.result.value as T;
   }
 
-  async listTargets(port = 9222): Promise<unknown[]> {
-    return (await CDP.List({ port })).map((target) => ({
+  async listTargets(port = 9223): Promise<unknown[]> {
+    return (await discoverTargets(port)).map((target) => ({
       id: target.id,
       type: target.type,
       title: target.title,
@@ -343,7 +353,7 @@ export class ObsidianConnection {
     if (targetId === this.mainTargetId && this.client) return this.client;
     let target = this.targetClients.get(targetId);
     if (!target) {
-      target = await CDP({ port: this.connectedPort, target: targetId });
+      target = await CDP({ host: '127.0.0.1', port: this.connectedPort, target: targetId });
       await target.Runtime.enable();
       await target.Page.enable();
       this.registerConsoleCapture(target, targetId);

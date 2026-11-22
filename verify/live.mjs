@@ -10,7 +10,7 @@
  *   npm run verify                 # read-only checks
  *   npm run verify -- --destructive # also mutate and restore an open Excalidraw board
  *
- * Obsidian must be running with --remote-debugging-port=9222.
+ * Obsidian must be running with --remote-debugging-port=9223.
  */
 import { obsidian } from '../dist/connection.js';
 import { CANVAS_HELPERS_JS, frameWatcherInstaller } from '../dist/renderer-scripts.js';
@@ -28,7 +28,7 @@ const skip = (name, why) => {
 };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const info = await obsidian.connect(9222);
+const info = await obsidian.connect(9223);
 console.log(`connected to vault "${info.vaultName}"\n`);
 
 // ---------------------------------------------------------------- user code
