@@ -37,6 +37,13 @@ npm run build
 
 Install and enable the [MCP Port plugin](obsidian-mcp-port/README.md). On the next fresh launch, it restarts Obsidian once with the DevTools port on `9223`. The plugin's own note endpoint opens immediately at `http://127.0.0.1:27124/mcp`.
 
+If a browser or another app already uses `9223`, set **Settings → MCP Port → DevTools port** to a
+free port such as `9224`, quit Obsidian and start it normally again. Then call `obsidian_connect`
+with `{ "port": 9224 }`. Changing the setting does not restart the current session; an explicit
+`--remote-debugging-port` launch flag takes precedence. The note endpoint and DevTools port must
+be different. Connection errors name the requested endpoint and HTTP status or socket failure;
+an empty 404 usually means this is the wrong port, rather than an Obsidian note-access problem.
+
 ### 3. Register with Claude Code
 
 ```bash
@@ -51,6 +58,9 @@ Reload the "doc-doctor" plugin and show any console errors.
 ```
 
 ## Available Tools
+
+Run `npm test` for offline HTTP discovery and MCP error-path checks. These need no running
+Obsidian. `npm run verify` additionally exercises a live Obsidian session on port `9223`.
 
 ### Tool discovery and profiles
 

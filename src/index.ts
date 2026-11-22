@@ -1728,7 +1728,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error(`Unknown tool: ${name}`);
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = (error instanceof Error ? error.message : String(error)).trim() || 'Operation failed without an error message.';
     return {
       content: [{ type: 'text', text: toolText(`Error: ${message}`) }],
       isError: true,

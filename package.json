@@ -8,6 +8,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
+    "test": "npm run build && node --test verify/discovery.test.mjs",
     "verify": "npm run build && node verify/live.mjs"
   },
   "keywords": ["obsidian", "mcp", "devtools", "electron"],
